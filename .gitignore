@@ -1,0 +1,16 @@
+# Nunca subir backups de flash, claves ni configuración de una placa real.
+*backup*.bin
+*.sha256
+read-*.bin
+wifi-sta.conf
+credentials.txt
+authorized_keys
+root_authorized_keys
+id_*
+*.pem
+*.key
+# Restos de compilación de los ejemplos
+*.gdb
+examples/c-hello/hello
+examples/c-sysinfo/sysinfo
+.DS_Store
