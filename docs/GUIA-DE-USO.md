@@ -826,6 +826,101 @@ Límites:
 - Si entrás como `root`, el PATH no incluye `/home/m5/bin`: usá
   `/home/m5/bin/navegar`.
 
+### 11.10 Escribir tus propios programas en la microSD
+
+No hay `nano` ni un IDE en la placa.  Lo más cómodo es escribir el
+programa en la computadora y subirlo a `/home/m5/bin`, que está en la
+microSD y sobrevive a los reinicios.
+
+**Dónde se guarda cada cosa** (verificado en `/proc/mounts`):
+
+| Carpeta | Dónde vive | ¿Sobrevive a un reinicio? |
+|---|---|---|
+| `/home/m5` (y `/home/m5/bin`) | microSD, ext4 (`WSDATA`, `mmcblk0p1`) | sí |
+| `/mnt/sd` | la misma partición; `/home/m5` está dentro, en `persist/home` | sí |
+| `/mnt/archivos` | microSD, FAT32 (`WSFILES`), se lee desde la computadora | sí |
+| `/boot` | flash interna | sí, con `boot-save` |
+| `/home` fuera de `m5`, `/tmp`, `/root` | RAM | **no** |
+
+**1. Escribir en la computadora y subir con `scp` (recomendado)**
+
+```bash
+scp -O miprograma.py m5@stamp-p4.local:/home/m5/bin/     # subir
+scp -O m5@stamp-p4.local:/home/m5/bin/miprograma.py .    # bajar
+```
+
+Sin `-O`, el `scp` de la Mac usa SFTP y falla con
+`can't execute '/usr/libexec/sftp-server'` y `Connection closed`.
+
+**2. Editar en la placa con `vi`** (el de BusyBox):
+
+```sh
+vi /home/m5/bin/miprograma.py
+```
+
+| Tecla | Qué hace |
+|---|---|
+| `i` | empezar a escribir |
+| `Esc` | dejar de escribir |
+| `:wq` + Enter | guardar y salir |
+| `:q!` + Enter | salir sin guardar |
+
+**3. Algo corto, sin editor:**
+
+```sh
+cat > /home/m5/bin/hola.py << 'FIN'
+print("hola")
+for i in range(3):
+    print(i)
+FIN
+```
+
+Para probar línea por línea: `micropython` solo abre el intérprete
+interactivo (`>>>`); `Ctrl+D` sale.
+
+**Ejecutar**
+
+```sh
+micropython /home/m5/bin/hola.py        # sin red segura
+micropython-tls /home/m5/bin/hola.py    # si usa https o ssl
+```
+
+Probado el 2026-11-23: un `hola.py` subido con `scp -O` desde la Mac se
+ejecutó con `micropython` y respondió `hola desde la placa`.
+
+Para que un programa se ejecute con solo escribir su nombre, hacé un
+lanzador de shell como `navegar` y dale permiso de ejecución:
+
+```sh
+cat > /home/m5/bin/hola << 'FIN'
+#!/bin/sh
+exec micropython "$(dirname "$0")/hola.py" "$@"
+FIN
+chmod 755 /home/m5/bin/hola
+```
+
+- Como `m5`, `/home/m5/bin` ya está en el PATH (lo agrega
+  `/home/m5/.profile`), así que alcanza con `hola`.
+- Como `root`, o desde otra carpeta, usá la ruta completa
+  (`/home/m5/bin/hola`).  Dentro de la carpeta, `./hola`.  `hola` solo da
+  `sh: can't execute 'hola': No such file or directory`.
+- Como root, también podés agregar la carpeta al PATH de la sesión:
+  `export PATH=/home/m5/bin:$PATH`.
+
+**Otras formas de pasar archivos**
+
+- Sacar la microSD y copiar desde la computadora a la partición
+  `WSFILES`.  En la placa aparece en `/mnt/archivos`.  `WSDATA` es ext4 y
+  Windows o macOS no la abren sin software extra.
+- `wget` desde una dirección web (http o https).
+
+> **Cuidado:** no corras `df` sobre `/mnt/archivos`.  En una prueba tardó
+> más de 2 minutos, la placa dejó de responder y se reinició.  Después el
+> kernel avisó que la partición FAT "no se desmontó bien".  La causa
+> probable, sin confirmar: contar el espacio libre de una FAT grande por el
+> SPI por software ocupa el único núcleo y salta el watchdog.  Sobre
+> `/home/m5`, `df` funciona bien.
+
 ---
 
 ## Anexo A. Qué se hizo y por qué funcionó
