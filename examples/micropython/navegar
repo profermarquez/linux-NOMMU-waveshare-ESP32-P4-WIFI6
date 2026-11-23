@@ -1,0 +1,3 @@
+#!/bin/sh
+# navegar [URL] - mini navegador de texto (MicroPython, micropython-tls).
+exec micropython-tls -X heapsize=1792K "$(dirname "$0")/navegador.py" "$@"

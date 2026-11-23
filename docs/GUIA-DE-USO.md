@@ -780,6 +780,52 @@ paquetes nuevos; para más hay que cambiar la tabla de particiones (el kernel
 tiene 7,5 MB, hoy usa 6,3 MB).  La microSD es el lugar para datos y
 programas propios.
 
+### 11.9 Mini navegador de texto (`navegar`)
+
+Un navegador de texto escrito en MicroPython: `examples/micropython/navegador.py`
+y el lanzador `examples/micropython/navegar`.  No es parte de la imagen.  Va
+en la microSD, en `/home/m5/bin`, así que no hace falta grabar la flash.
+
+**Instalar** (desde la Mac, en la carpeta del repositorio):
+
+```bash
+scp -O examples/micropython/navegador.py examples/micropython/navegar m5@stamp-p4.local:/home/m5/bin/
+ssh m5@stamp-p4.local 'chmod 755 /home/m5/bin/navegar; echo "export PATH=\"\$HOME/bin:\$PATH\"" >> /home/m5/.profile'
+```
+
+**Usar** (entrando como `m5`):
+
+```sh
+navegar                       # pantalla de inicio con páginas sugeridas
+navegar es.wikipedia.org/wiki/ESP32
+navegar -w 100 -l 30 URL      # ancho y alto de tu terminal (por defecto 80x24)
+```
+
+| Escribí | Qué hace |
+|---|---|
+| Enter / `-` | página siguiente / anterior |
+| un número | sigue el enlace `[N]` |
+| `b` | vuelve a la página anterior |
+| una dirección, o `g DIRECCIÓN` | la abre (`https://` si no se indica) |
+| `buscar PALABRAS` | busca en DuckDuckGo (versión lite) |
+| `/TEXTO` | busca en la página; `/` solo: la siguiente |
+| `l`, `i` | lista de enlaces, datos de la página |
+| `s ARCHIVO` | guarda el texto y los enlaces |
+| `r`, `t`, `?`, `q` | recargar, principio, ayuda, salir |
+
+Probado en la placa con Wikipedia, DuckDuckGo lite, text.npr.org,
+lite.cnn.com (267 KB) y Hacker News.  Una página de 100 KB tarda ~30 s; una
+de 25 KB, 2–3 s.  Verifica los certificados HTTPS como `https-get`.
+
+Límites:
+- sin JavaScript, CSS, imágenes ni formularios (salvo la búsqueda);
+- descarga como máximo 300 KB por página (el resto se corta y lo avisa);
+- usa un heap de 1,75 MB, porque con más MicroPython no arranca, y conserva
+  8 páginas en el historial;
+- las páginas que se arman con JavaScript se ven vacías.
+- Si entrás como `root`, el PATH no incluye `/home/m5/bin`: usá
+  `/home/m5/bin/navegar`.
+
 ---
 
 ## Anexo A. Qué se hizo y por qué funcionó
