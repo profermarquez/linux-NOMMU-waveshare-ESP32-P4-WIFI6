@@ -1,4 +1,9 @@
-# Linux NOMMU para la Waveshare ESP32-P4-WIFI6
+# Linux NOMMU para la Waveshare ESP32-P4-WIFI6 — v2 "mejorado"
+
+> **Rama v2.**  Suma a la v1 microSD, NTP/zona horaria, varias redes Wi-Fi y
+> punto de acceso, HTTPS, C++, GPIO, I2C y SPI.  Detalle y límites:
+> **[CHANGELOG.md](CHANGELOG.md)**.  La v1 sigue en la rama `main`
+> ([docs/VOLVER-A-V1.md](docs/VOLVER-A-V1.md)).
 
 Linux 7.2.11 (sin MMU, riscv32) para la placa
 [Waveshare ESP32-P4-WIFI6](https://www.waveshare.com/esp32-p4-wifi6.htm):
@@ -17,20 +22,25 @@ v0.5.1 (perfil `m3-lab`), adaptado a esta placa.
 | | Estado |
 |---|---|
 | Linux en la consola serie (USB-C, 115200) | ✅ |
-| Wi-Fi cliente WPA2, DHCP, DNS, Internet | ✅ |
+| Wi-Fi cliente WPA2 con varias redes (`wifi-connect`, `wifi.txt` en la microSD) | ✅ |
+| Wi-Fi punto de acceso (`ap-on`) | ✅ |
 | SSH (Dropbear) con clave o contraseña, `scp -O` | ✅ |
-| mDNS (`stamp-p4.local`) | ✅ |
-| MicroPython 1.22.2 (`python3`), `vi`, `wget` (HTTP) | ✅ |
-| Programas en C compilados aparte (bFLT) | ✅ |
-| Configuración, claves y programas persistentes en `/boot` (256 KB) | ✅ con `boot-save` |
-| Wi-Fi punto de acceso, HTTPS/TLS, IPv6, C++ | ❌ |
-| GPIO, I2C, SPI desde Linux | ❌ |
-| microSD, USB OTG | ❌ (ver `docs/GUIA-DE-USO.md`, sección 8) |
+| mDNS (`stamp-p4.local`), hora por NTP, zona horaria | ✅ |
+| MicroPython 1.22.2 (`python3`), `vi`, `wget` | ✅ |
+| HTTPS con verificación (`https-get`, `wget https://`, `micropython-tls`) | ✅ TLS 1.2 |
+| Programas en C y C++ compilados aparte (bFLT) | ✅ |
+| microSD (persistencia y archivos) | ✅ |
+| GPIO (`pin`, libgpiod 2, `gpio.py`) | ✅ |
+| I2C (GPIO7/8, `i2c-tools`) | ✅ |
+| SPI (GPIO21/22/23/26, `/dev/spidev1.0`) | ⚠️ loopback sin verificar |
+| Temperatura del chip | ⏸️ en pausa |
+| IPv6, USB OTG, segundo núcleo | ❌ |
 
 Límites importantes:
 
-- **Recursos:** 1 núcleo, ~16 MB de RAM para Linux, y un pool de 10 MB
-  para programas (un programa puede reservar unos 2 MB).
+- **Recursos:** 1 núcleo, ~14 MB de RAM para Linux, y un pool de 12 MB
+  para programas.  Cada programa tiene que entrar en un bloque de ~496 KB.
+  Una conexión HTTPS usa ~1 MB.
 - **Red:** Wi-Fi por SDIO de 1 bit a 5 MHz, unos 150 KB/s.
 
 ## Requisitos
@@ -65,8 +75,11 @@ a paso, backup y recuperación: **[docs/INSTALAR.md](docs/INSTALAR.md)**.
 | `docs/INSTALAR.md` | Instalación, primer arranque, Wi-Fi, SSH, backup y restauración |
 | `docs/GUIA-DE-USO.md` | Guía completa: conectarse, programar, límites, microSD/USB, proyectos |
 | `docs/COMPILAR.md` | Cómo compilar las imágenes desde el código fuente |
-| `source/0001-waveshare-esp32-p4-wifi6.patch` | Los cambios respecto del proyecto base (aplicar sobre el commit `69a7312`) |
-| `examples/` | Ejemplos probados: shell, MicroPython (cliente y servidor HTTP), C (`c-hello`, `c-sysinfo`) |
+| `docs/PINES-GPIO.md` | Tabla de pines del conector (GPIO, I2C, SPI, reservados) |
+| `docs/VOLVER-A-V1.md` | Cómo volver a la v1 (y de nuevo a la v2) |
+| `CHANGELOG.md` | Qué cambió en la v2, qué está limitado y qué falló |
+| `source/0001-waveshare-esp32-p4-wifi6-v2.patch` | Los cambios respecto del proyecto base (aplicar sobre el commit `69a7312`) |
+| `examples/` | Ejemplos: shell, MicroPython (cliente y servidor HTTP), C (`c-hello`, `c-sysinfo`, `c-gpio`), C++ (`cpp/`), `wifi-ejemplo.txt` |
 | `LICENSE` | GPL-2.0, la licencia del proyecto base |
 
 ## Imágenes
@@ -75,10 +88,10 @@ a paso, backup y recuperación: **[docs/INSTALAR.md](docs/INSTALAR.md)**.
 |---|---|---|
 | 0x2000 | `bootloader.bin` | `5bd36231c4a258fd5b9efd029901655ce3ab04db3427d09db7f2890a37787820` |
 | 0x8000 | `partition-table.bin` | `94f1b217ada457065b0e87bbf2be394ac5968003f7197ff6d9229af2a663fc32` |
-| 0x10000 | `boot-shim.bin` | `cc7b0e01d495d9aeec5026d5c49cad8935c0175c4ac747bcf6c418fa50fce12a` |
-| 0x90000 | `Image` | `383b012f1f3cf8040abd8802b811d0d511b0afe8e2482171357defa2d291927e` |
-| 0x810000 | `rootfs.squashfs` | `b7daff36a1c9597eb041fddac0c854dba2169e17bec930952f92c4d90ca507a5` |
-| 0xF10000 | `esp32p4-m5stamp-p4.dtb` | `441e82fe82d660912593771c6b86fef22f3bc9507b2a45497e95ce51e2148655` |
+| 0x10000 | `boot-shim.bin` | `35702e0b0e2650c70817f4395e8d0ffda2c2a85ee0a61d306232983cedd32852` |
+| 0x90000 | `Image` | `f9cf0d93c5b969d123d4a57fc89399e28de2e1547a302e677f68a653354d1b89` |
+| 0x810000 | `rootfs.squashfs` | `a3c5392483a7dbeb0876e3dcee1f99dfcb4db206af624e61f533b63c952721d0` |
+| 0xF10000 | `esp32p4-m5stamp-p4.dtb` | `ba772ebbae4c5435ad493bfc0cc93f873bb321b8825084705f0914395eb14e94` |
 | 0xF40000 | `boot.img` (`/boot` de fábrica) | `96c9bb28d5568055452b484d66525c992e72cedf4eb987b516f6f2ab87a8eb39` |
 
 El DTB conserva el nombre del proyecto base, pero es el de esta placa
@@ -95,7 +108,7 @@ El DTB conserva el nombre del proyecto base, pero es el de esta placa
 | Componente | Versión |
 |---|---|
 | Kernel | Linux 7.2.11 NOMMU riscv32 |
-| Rootfs | Buildroot 2025.02.15, uClibc-ng, BusyBox 1.37.0, Dropbear 2026.91, MicroPython 1.22.2 |
+| Rootfs | Buildroot 2025.02.15, uClibc-ng, BusyBox 1.37.0, Dropbear 2026.91, MicroPython 1.22.2, mbedTLS 3.6, libgpiod 2.2, i2c-tools |
 | Boot shim / bootloader | ESP-IDF v5.5.3 |
 | Wi-Fi (P4) | ESP-Hosted-MCU 3.0.10: módulo `esp_hosted_mcu.ko` + daemon `eh-wifi-sta` |
 | Wi-Fi (C6, requerido) | ESP-Hosted-MCU 3.0.10 (fw `0x0003000a`, RPC V2) |

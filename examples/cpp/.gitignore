@@ -1,0 +1,6 @@
+# built by make (see Makefile)
+/build/
+/stl-demo
+/sockets-demo
+/threads-demo
+*.gdb

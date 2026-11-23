@@ -136,8 +136,8 @@ wifi-connect
 
 1. Escribí el **nombre de la red** (respeta mayúsculas) y la **contraseña**
    (no se muestra).
-2. Se guarda en `/boot/wifi-sta.conf` y se graba en la flash
-   (`boot-save`).
+2. Se guarda primera (máxima prioridad) en `/boot/wifi-networks.conf` y,
+   si hay microSD, también en la tarjeta.
 3. Al terminar muestra la IP (`inet addr:`).
 
 **Alternativa manual** (como root), útil si `wifi-connect` falla:
@@ -151,9 +151,16 @@ boot-save
 sleep 20; ifconfig ethsta0
 ```
 
+**Sin consola (v2):** escribí las redes en `wifi.txt` en la partición
+`WSFILES` de la microSD (ver `examples/wifi-ejemplo.txt` y la sección 11.2
+de la guía).
+
+El método manual de arriba sigue sirviendo: la v2 importa
+`/boot/wifi-sta.conf` una vez a su lista de redes.
+
 Notas:
 - Solo redes **2.4 GHz**, WPA2-PSK.
-- El modo punto de acceso no está disponible.
+- Punto de acceso: `ap-on` (v2, ver la guía, sección 11.2).
 
 > `wifi-connect` está en la imagen, pero en la placa de prueba la red se
 > cargó con el método manual.  Si `wifi-connect` falla, usá el manual y

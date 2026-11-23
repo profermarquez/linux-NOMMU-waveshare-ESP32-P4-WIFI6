@@ -6,6 +6,13 @@ código fuente.  En las tablas:
 - **Verificado**: lo probé en la placa.
 - **Teórico**: sale del código o de la documentación, sin prueba en la placa.
 
+> **v2 (2026-11-23).**  Esta rama agrega microSD, NTP y zona horaria,
+> varias redes Wi-Fi y punto de acceso, HTTPS, C++, GPIO, I2C y SPI.  Lo
+> nuevo está en la **sección 11**.  La tabla de la sección 6 ya está al día.
+> Las secciones 1 a 5 y 7 a 10 describen la v1: donde dicen "no hay", mirá
+> primero la sección 11.  Cambios y límites: `CHANGELOG.md`.  Volver a la v1:
+> `docs/VOLVER-A-V1.md`.
+
 ---
 
 ## 1. Resumen de una página
@@ -116,6 +123,9 @@ La IP la da el router por DHCP.
 ## 3. Cambiar la red Wi-Fi y las contraseñas
 
 ### 3.1 Red Wi-Fi
+
+> v2: además de lo de abajo, hay `wifi-connect`, `wifi-scan`,
+> `wifi-status`, `wifi-forget` y `wifi.txt` en la microSD (sección 11.2).
 
 Por SSH como root, o en la consola serie:
 
@@ -288,30 +298,33 @@ Para que un programa quede guardado después de reiniciar: copialo a
 
 ## 6. Tabla de capacidades
 
+Estado en la **v2**.  "Verificado" = probado en la placa.
+
 | Capacidad | Estado | Explicación |
 |---|---|---|
-| Wi-Fi cliente (WPA2) | ✅ Funciona | Verificado: IP por DHCP, DNS, Internet. |
-| Wi-Fi punto de acceso | ❌ No | La interfaz `ethap0` existe, pero no hay programa que la configure. |
+| Wi-Fi cliente (WPA2) | ✅ Funciona | Varias redes con prioridad (`eh-wifid`).  Verificado. |
+| Wi-Fi punto de acceso | ✅ Funciona | `ap-on` / `ap-off` / `ap-config`.  Sección 11.2. |
 | SSH con clave / contraseña | ✅ Funciona | Dropbear por inetd.  Host key nueva en cada arranque. |
 | scp | ⚠️ Limitado | Solo con `scp -O`.  Sin sftp. |
 | mDNS (`stamp-p4.local`) | ✅ Funciona | Verificado desde una Mac. |
-| DNS | ✅ Funciona | Usa el del router. |
-| Hora por NTP | ⚠️ Limitado | `ntpd` existe y responde, pero **no corre al arrancar**: el reloj estaba ~25 h atrasado (en UTC). |
+| Hora por NTP y zona horaria | ✅ Funciona | Al recibir IP.  `config.txt` en la microSD.  Sección 11.3. |
 | HTTP cliente | ✅ Funciona | `wget` y sockets de MicroPython. |
-| HTTPS / TLS | ❌ No | No hay librería TLS (ni `ssl` en MicroPython, ni `openssl`, ni `wget` con TLS). |
+| HTTPS / TLS | ✅ Funciona (TLS 1.2) | `https-get`, `wget https://…`, `micropython-tls`.  Verifica certificado y nombre.  ~1 MB de RAM por conexión.  Sección 11.4. |
 | IPv6 | ❌ No | Desactivado en el kernel. |
-| MicroPython 1.22.2 | ✅ Funciona | Módulos verificados en la sección 9.3. |
+| MicroPython 1.22.2 | ✅ Funciona | `micropython` (sin `ssl`) y `micropython-tls` (con `ssl`). |
 | Programas en C (bFLT) | ✅ Funciona | Compilados en la VM. |
-| C++ | ❌ No | Sin `g++` en la toolchain actual. |
-| Persistencia de archivos | ⚠️ Limitado | Solo `/boot` (256 KB) y solo con `boot-save`. |
-| microSD | ❌ No (por ahora) | Comparte el controlador con el C6.  Ver sección 8. |
-| USB (pendrive, disco, red) | ❌ No (por ahora) | Ver sección 8. |
-| GPIO desde Linux | ❌ No usable | Existe `/dev/gpiochip0`, pero no hay herramienta (`gpioset`) ni módulo `machine.Pin`. |
-| I2C / SPI | ❌ No | Desactivados en el kernel (`i2cdetect` está, pero no hay `/dev/i2c-*`). |
+| C++ | ✅ Funciona | STL, excepciones, threads, sockets.  Toolchain aparte.  Sección 11.5. |
+| Persistencia de archivos | ✅ Funciona | `/boot` (256 KB, `boot-save`) y **microSD**. |
+| microSD | ✅ Funciona | Por SPI (spi-gpio), junto con el Wi-Fi.  Sección 11.1. |
+| USB (pendrive, disco, red) | ❌ No | Ver sección 8.2. |
+| GPIO desde Linux | ✅ Funciona | `pin`, libgpiod 2.2, `gpio.py`, ejemplo en C.  Verificado con un LED.  Sección 11.6. |
+| I2C | ✅ Funciona | Por software en GPIO7/8, `/dev/i2c-0`.  Verificado: `i2cdetect` ve el códec ES8311 (0x18). |
+| SPI | ⚠️ Parcial | Por software, `/dev/spidev1.0`.  Transfiere; loopback MOSI→MISO sin verificar. |
 | UART extra | ❌ No | Solo la consola `ttyS0`. |
-| LED / botones | ❌ No desde Linux | La placa solo tiene LED de encendido.  BOOT/RST no son accesibles como entrada. |
-| Sensor de temperatura del chip | ❌ No | Está en el DTB, pero ningún driver lo toma (no aparece en `hwmon`). |
-| Deep sleep / LP core | ❓ No probado | Están las interfaces de M5Stamp; ver sección 9.4. |
+| LED / botones | ⚠️ Externos | La placa solo tiene el LED de encendido.  Un LED o botón en un GPIO libre sí funciona. |
+| Sensor de temperatura del chip | ⏸️ En pausa | El driver colgaba el arranque; desactivado (comando `temperatura` presente, sin sensor). |
+| Deep sleep / LP core | ❓ No probado | |
+| Segundo núcleo | ❌ No | Linux corre en 1 núcleo. |
 | tcpdump | ✅ Instalado | Para mirar tráfico de red. |
 
 ---
@@ -369,6 +382,9 @@ de responder del todo.
 ## 8. microSD y USB
 
 ### 8.1 microSD
+
+> v2: **la microSD ya funciona**, por SPI y sin afectar el Wi-Fi (sección
+> 11.1).  Lo que sigue es el análisis de la v1.
 
 **Dónde está conectada** (evidencia):
 
@@ -622,6 +638,147 @@ explica cómo volver.  El C6 no se toca en ningún caso.
 | 10 | **Segundo núcleo (SMP)** | Investigar por qué la CPU1 no responde en esta placa. | Alto |
 | 11 | **microSD + Wi-Fi juntos** | Parche multi-slot de `dw_mmc` (opción B). | Alto |
 | 12 | **USB host (pendrive)** | Ver sección 8.2.a. | Alto |
+
+---
+
+## 11. Novedades de la v2
+
+Todo esto se probó en la placa salvo donde se aclara.
+
+### 11.1 microSD
+
+La ranura se maneja por SPI por software (GPIO39–44, `spi-gpio` + `mmc_spi`),
+así que **no compite con el Wi-Fi** (el C6 sigue en SDIO).  Es lenta pero
+sirve para configuración y archivos.
+
+La placa solo usa particiones con estas **etiquetas**:
+
+| Etiqueta | Sistema | Dónde | Para qué |
+|---|---|---|---|
+| `WSDATA` | ext2/ext4 | `/mnt/sd` | Persistencia: `persist/config/` (credenciales, claves SSH, `config.txt`, redes Wi-Fi) y `persist/home/m5/`, que se monta sobre `/home/m5` |
+| `WSFILES` | FAT32 | `/mnt/archivos` | Archivos para pasar desde/hacia la computadora; acá va `wifi.txt` |
+
+Una tarjeta sin esas etiquetas **no se monta en escritura**: así no se
+pisan datos ajenos.  Para apagar sin perder datos: `poweroff` (desmonta la
+tarjeta).
+
+### 11.2 Wi-Fi: varias redes y punto de acceso
+
+```sh
+wifi-scan                  # redes cercanas
+wifi-connect [SSID]        # guarda una red (pide la clave sin mostrarla) y se conecta
+wifi-status                # estado, IP, redes guardadas
+wifi-forget SSID           # borra una red
+wifi-reload                # vuelve a leer wifi.txt y las redes guardadas
+ap-on / ap-off             # punto de acceso (ap-off se niega si no hay red cliente; "ap-off force")
+ap-config                  # ver/cambiar SSID, canal (canal=N) y clave del AP
+```
+
+**Sin teclado:** desde la computadora, copiá `examples/wifi-ejemplo.txt` a la
+raíz de la partición `WSFILES` como `wifi.txt`.  Escribí pares
+`ssid=` / `clave=`; la primera red tiene prioridad.  La placa lo lee al
+encender (o con `wifi-reload`) y nunca lo modifica.  `wifi.txt` tiene
+contraseñas: no lo subas a ningún repositorio.
+
+Con el AP encendido, la placa queda en `192.168.4.1`.
+
+### 11.3 Hora y zona horaria
+
+Al recibir IP por DHCP, `time-sync` pone la hora por NTP.  En
+`config.txt` (en `persist/config/` de la microSD, o en `/boot`):
+
+```
+ntp_server=pool.ntp.org
+timezone=America/Argentina/Cordoba
+```
+
+`ntp_server=none` desactiva el NTP.  La zona puede ser un nombre de la tabla
+de `time-sync` o una cadena POSIX (`ART3`).
+
+### 11.4 HTTPS
+
+```sh
+https-get https://example.com/                 # imprime el cuerpo; -o ARCHIVO, -S cabeceras
+wget -O pagina.html https://example.com/       # wget delega https:// en https-get
+```
+
+Verifica la cadena de certificados contra el bundle del sistema y el nombre
+del servidor.  Códigos de salida: 0 OK, 2 red/DNS, 3 TLS o certificado.
+Probado contra badssl.com: rechaza certificados vencidos, autofirmados o con
+otro nombre.
+
+MicroPython con TLS:
+
+```python
+# micropython-tls   (el micropython normal no tiene ssl)
+import https
+status, headers, body = https.get("https://example.com/")
+```
+
+Límites: solo TLS 1.2.  ~1 MB de RAM por conexión mientras dura.  **Un
+`ssl.SSLContext` sin configurar no verifica** en MicroPython 1.22: usá el
+módulo `https` o `verify_mode = ssl.CERT_REQUIRED` + `load_verify_locations()`.
+Sin la hora correcta (11.3) los certificados se ven inválidos.
+
+### 11.5 C++
+
+Ver `examples/cpp/LEEME.md`.  Se compila con una toolchain C++ aparte (la
+imagen no cambia) y se copia por SSH: `make`, `make deploy`, `make run`.
+Hay que usar `-fPIC` y las reglas de `board.mk`.  Cada programa tiene que
+entrar en ~496 KB (código + datos + pila): `iostream` completo no entra.  Usá
+`printf` o `std::string`.
+
+### 11.6 GPIO
+
+Tabla completa: `docs/PINES-GPIO.md`.  Pines de 3,3 V; nunca 5 V.
+
+```sh
+pin lista                 # pines del conector
+pin 20 1 ; pin 20 0       # salida
+pin 47 leer pullup        # entrada con pull-up interno
+pin 20 parpadear 10 250   # 10 veces cada 250 ms
+```
+
+```python
+from gpio import Pin       # en micropython; ~31 ms por operación
+led = Pin(20, Pin.OUT); led.toggle()
+```
+
+En C: `examples/c-gpio/gpio-parpadeo.c` (libgpiod 2).  Para probar, conectá un
+LED con una resistencia de 330 Ω entre el GPIO y GND.  Desconectá la placa
+antes de mover cables: un contacto con `RUN` o `EN` la reinicia, y uno con
+`GND` cortocircuita el pin si está en alto.
+
+### 11.7 I2C y SPI
+
+| Bus | Pines | Dispositivo |
+|---|---|---|
+| I2C (software, ~100 kHz) | GPIO7 SDA, GPIO8 SCL | `/dev/i2c-0` |
+| SPI (software, ≤1 MHz) | GPIO21 SCK, 22 MOSI, 23 MISO, 26 CS | `/dev/spidev1.0` |
+
+```sh
+i2cdetect -y 0                     # el códec de audio ES8311 responde en 0x18
+i2cget -y 0 0x18 0xfd              # 0x83 (ID del ES8311)
+spidev_test -D /dev/spidev1.0 -s 100000 -p "HOLA" -v
+```
+
+El bus I2C ya tiene el códec de la placa (0x18): no uses esa dirección.  Los
+sensores I2C comunes (BME280, SHT31, OLED SSD1306) van en GPIO7/8 con 3,3 V.
+
+**SPI, prueba pendiente:** con un cable **solo** entre GPIO22 y GPIO23 (pines
+9 y 10 de la fila derecha; el 8 es GND), `spidev_test` tiene que devolver en
+RX lo mismo que envía.  En la prueba de la v2 el cable tocaba GND y no se
+pudo confirmar.
+
+Con un solo núcleo, la CPU queda ocupada mientras dura cada transferencia
+I2C/SPI.
+
+### 11.8 Espacio
+
+El rootfs usa 6,49 MB de su partición de 7 MB.  Quedan ~0,5 MB para
+paquetes nuevos; para más hay que cambiar la tabla de particiones (el kernel
+tiene 7,5 MB, hoy usa 6,3 MB).  La microSD es el lugar para datos y
+programas propios.
 
 ---
 

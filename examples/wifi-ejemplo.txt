@@ -1,0 +1,14 @@
+# Redes Wi-Fi para la Waveshare ESP32-P4 (Linux v2).
+#
+# Copia este archivo como  wifi.txt  (en esta misma carpeta raiz de la
+# microSD) y escribi una red por cada par de lineas  ssid= / clave= .
+# La primera red tiene prioridad.  Mayusculas y minusculas importan.
+# Red abierta: deja  clave=  vacio.  Las lineas con # se ignoran.
+# Guardalo como texto plano (TextEdit: Formato > Convertir a texto normal).
+# La placa lo lee al encender (o con: wifi-reload) y nunca lo modifica.
+#
+# ssid=MiRed
+# clave=MiClaveSecreta
+#
+# ssid=OtraRed
+# clave=OtraClave

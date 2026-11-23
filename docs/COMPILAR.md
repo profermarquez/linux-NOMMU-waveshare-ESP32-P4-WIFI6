@@ -12,7 +12,7 @@ mkdir ws && cd ws
 git clone https://github.com/tsuyoshi-otake/m5stamp-p4-c6-linux.git src
 cd src
 git checkout 69a7312c97d67074abcc197d8454a9cb0a7d7ee0     # v0.5.1
-git apply /ruta/a/linux-NOMMU-waveshare-ESP32-P4-WIFI6/source/0001-waveshare-esp32-p4-wifi6.patch
+git apply /ruta/a/linux-NOMMU-waveshare-ESP32-P4-WIFI6/source/0001-waveshare-esp32-p4-wifi6-v2.patch
 git submodule update --init --recursive                    # si el proyecto base lo pide
 cd ..
 ```
