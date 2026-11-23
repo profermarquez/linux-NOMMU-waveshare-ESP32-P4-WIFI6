@@ -921,6 +921,249 @@ chmod 755 /home/m5/bin/hola
 > SPI por software ocupa el único núcleo y salta el watchdog.  Sobre
 > `/home/m5`, `df` funciona bien.
 
+### 11.11 SQLite, servidores web, APIs e IA (TensorFlow Lite Micro)
+
+Todo esto va en la microSD (`/home/m5/bin` y `/home/m5/.micropython/lib`):
+no se graba la flash, no cambia la imagen y no hace falta otro driver.
+Probado en la placa el 2026-11-23.
+
+| Programa | Qué es | Lenguaje | RAM al arrancar |
+|---|---|---|---|
+| `sqlite3` | SQLite 3.54.1: base de datos y consola para ver tablas | C | ~1,1 MB |
+| `ver_tablas.py` | visor web de tablas SQLite, puerto 8080 | MicroPython + Microdot | — |
+| `sqlite.py` | módulo para usar SQLite desde MicroPython | MicroPython | — |
+| `servidor-web` | servidor web de archivos + API JSON, puerto 8000 | C + Mongoose | 226 KB |
+| `api-sqlite` | API REST sobre una tabla SQLite, puerto 8001 | C + Mongoose + SQLite | 770 KB |
+| `api_microdot.py` | API REST de notas, puerto 8002 | MicroPython + Microdot | — |
+| `tflm-seno` | TensorFlow Lite Micro: modelo de ejemplo y `.tflite` propios | C++ | 310 KB |
+
+Las bibliotecas de terceros no están en el repositorio: `descargar.sh` las
+baja y verifica su SHA-256.
+
+| Biblioteca | Versión | Licencia |
+|---|---|---|
+| SQLite | 3.54.1 | dominio público |
+| Microdot | 2.8.0 | MIT |
+| Mongoose | 7.24 | **GPLv2** (o licencia comercial de Cesanta si el programa se distribuye cerrado) |
+| TensorFlow Lite Micro | commit `38a8f0f` | Apache-2.0 |
+
+#### Instalar (desde la Mac, en la carpeta del repositorio)
+
+Hace falta la VM de compilación con el compilador C++ (ver
+`examples/cpp/LEEME.md` y `docs/COMPILAR.md`).
+
+```bash
+orb -m rv32dev sh examples/terceros/descargar.sh     # una vez, ~45 MB
+make -C examples/c-api deploy PLACA=stamp-p4.local   # sqlite3, servidor-web, api-sqlite
+make -C examples/tflm deploy PLACA=stamp-p4.local    # tflm-seno y los modelos .tflite
+ssh m5@stamp-p4.local 'mkdir -p /home/m5/.micropython/lib/microdot'
+scp -O examples/terceros/microdot/*.py m5@stamp-p4.local:/home/m5/.micropython/lib/microdot/
+scp -O examples/sqlite/sqlite.py m5@stamp-p4.local:/home/m5/.micropython/lib/
+scp -O examples/sqlite/ver_tablas.py examples/sqlite/api_microdot.py m5@stamp-p4.local:/home/m5/bin/
+```
+
+MicroPython busca módulos en `~/.micropython/lib`, así que `import
+microdot` e `import sqlite` funcionan como `m5` sin tocar nada más.
+
+#### SQLite desde la consola
+
+```sh
+sqlite3 /home/m5/datos.db
+sqlite> CREATE TABLE lecturas(id INTEGER PRIMARY KEY, sensor TEXT, valor REAL,
+   ...>   hora TEXT DEFAULT CURRENT_TIMESTAMP);
+sqlite> INSERT INTO lecturas(sensor, valor) VALUES ('temp', 23.5);
+sqlite> .tables
+sqlite> .schema lecturas
+sqlite> .mode box
+sqlite> SELECT * FROM lecturas;
+sqlite> .quit
+```
+
+En una sola línea: `sqlite3 -box /home/m5/datos.db "SELECT * FROM lecturas"`,
+o `-json` para JSON.  Dentro de SQL los textos van con comillas simples
+(`'temp'`).  Con comillas dobles da `no such column`.
+
+**Velocidad de escritura** (medida; la microSD va por SPI por software):
+
+| Configuración | Una escritura |
+|---|---|
+| por defecto (`journal_mode=DELETE`, `synchronous=FULL`) | ~5,7 s |
+| `PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=NORMAL;` | ~1,2 s |
+| `PRAGMA synchronous=OFF;` | 0,06 s, pero un corte de luz puede dañar la base |
+| 1000 filas dentro de un `BEGIN; … COMMIT;` | 0,08 s en total |
+
+Leer es rápido (0,05–0,3 s).  Recomendación:
+- usar `TRUNCATE` + `NORMAL`, que es lo que usan `api-sqlite` y `sqlite.py`;
+- agrupar muchas escrituras en una transacción.
+
+`CURRENT_TIMESTAMP` guarda la hora en UTC; para la hora local usá
+`datetime('now','localtime')`.
+
+Compilado sin WAL ni mmap (necesitan memoria compartida, que este kernel
+NOMMU no tiene) y sin extensiones.  El resto es SQLite normal, con funciones
+JSON incluidas.
+
+#### Ver las tablas en el navegador
+
+```sh
+micropython /home/m5/bin/ver_tablas.py /home/m5/datos.db
+```
+
+Después abrí `http://stamp-p4.local:8080/` en la computadora:
+- lista de tablas con su cantidad de filas;
+- cada tabla con sus columnas y los datos, de a 50 filas;
+- una página `/sql` para escribir consultas;
+- `/api/TABLA` devuelve las filas en JSON.
+
+**No tiene contraseña:** cualquiera en tu red puede abrirlo y ejecutar SQL.
+Cortalo con `Ctrl+C` cuando termines.
+
+#### SQLite desde MicroPython
+
+```python
+import sqlite
+db = sqlite.Base("/home/m5/datos.db")
+db.ejecutar("CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, nombre TEXT)")
+db.ejecutar("INSERT INTO t(nombre) VALUES (?)", ["it's ok"])  # ? = valor con comillas seguras
+print(db.consultar("SELECT * FROM t"))          # lista de dicts
+print(db.consultar_columnas("SELECT * FROM t")) # (columnas en orden, filas)
+print(db.tablas())
+```
+
+- No hay `import sqlite3` nativo en este MicroPython: `sqlite.py` llama al
+  comando `sqlite3` y lee su salida.  Cada llamada tarda ~0,1 s más lo que
+  tarde la escritura.
+- Los errores llegan como `sqlite.Error` con el mensaje de SQLite.
+- Probado con comillas, comas, saltos de línea, `NULL` y datos binarios.
+
+#### Servidor web en C (`servidor-web`)
+
+```sh
+mkdir -p /home/m5/www
+echo '<h1>Hola</h1>' > /home/m5/www/index.html
+servidor-web                    # o: servidor-web -p 8000 -d /home/m5/www
+```
+
+- Sirve los archivos de `/home/m5/www` en `http://stamp-p4.local:8000/`.
+- Además responde:
+  - `GET /api/hola`;
+  - `GET /api/memoria` (RAM y pool NOMMU);
+  - `POST /api/eco` (devuelve el JSON que recibe).
+- Probado con 20 pedidos al mismo tiempo: todos respondieron 200, en 0,46 s
+  en total.
+- Es un solo proceso con un bucle de eventos.  No usa `fork()`, que este
+  kernel no tiene.
+
+#### API REST en C con SQLite (`api-sqlite`)
+
+```sh
+api-sqlite                      # base /home/m5/lecturas.db, puerto 8001
+api-sqlite -b otra.db -p 9000 -d /home/m5/www   # también sirve páginas
+```
+
+| Pedido | Qué hace |
+|---|---|
+| `GET /api/lecturas?limite=N&sensor=S` | lista, las más nuevas primero |
+| `GET /api/lecturas/ID` | una |
+| `POST /api/lecturas` con `{"sensor":"temp","valor":23.5}` | agrega (201) |
+| `DELETE /api/lecturas/ID` | borra |
+| `GET /api/resumen` | cantidad, media, mínimo y máximo por sensor |
+
+Desde la computadora:
+
+```bash
+curl -d '{"sensor":"temp","valor":23.5}' http://stamp-p4.local:8001/api/lecturas
+curl http://stamp-p4.local:8001/api/resumen
+```
+
+Medido:
+- escribir tarda ~1 s;
+- leer, 0,04–0,3 s;
+- la primera vez que crea la base tarda unos segundos en empezar a
+  responder.
+
+Usa parámetros de SQLite (sin inyección SQL) y SQLite arma el JSON.  Para
+tu propia API, copiá `examples/c-api/api-sqlite.c`, agregá rutas en
+`atender()` y compilá con `make -C examples/c-api`.
+
+#### API REST en MicroPython (`api_microdot.py`)
+
+```sh
+micropython /home/m5/bin/api_microdot.py      # puerto 8002, base /home/m5/notas.db
+```
+
+Rutas:
+- `GET` y `POST /api/notas` (`{"texto":"..."}`);
+- `GET` y `DELETE /api/notas/ID`;
+- `GET /api/estado`.
+
+Microdot se escribe como Flask:
+
+```python
+from microdot import Microdot
+app = Microdot()
+
+@app.get("/api/hola")
+async def hola(req):
+    return {"mensaje": "hola"}
+
+app.run(port=8002)
+```
+
+Es más lento que la versión en C, porque cada consulta arranca `sqlite3`,
+pero se puede cambiar en la placa misma con `vi`.  En la prueba, los dos
+primeros pedidos de la primera ejecución no respondieron (sin error en el
+registro).  Después, todos los pedidos respondieron bien, incluidos textos
+con comillas.  No pude reproducirlo.
+
+#### Inteligencia artificial: TensorFlow Lite Micro (`tflm-seno`)
+
+```sh
+tflm-seno                                       # modelo de ejemplo (aprox. de sin(x))
+tflm-seno /home/m5/modelos/hello_world_float.tflite 0.5 1.57 3   # un .tflite propio
+tflm-seno -a 256 mimodelo.tflite 1.0            # arena de 256 KB si el modelo es grande
+```
+
+Salida real (modelo int8):
+
+```
+seno int8: entrada INT8, salida INT8, arena usado 748 de 8192 bytes
+     x   sin(x)   modelo   error   tiempo
+  1.57    1.000    1.003   0.003     32 us
+...
+promedio 35 us por inferencia, error maximo 0.116
+```
+
+El modelo float tarda ~155 µs por inferencia, con error máximo 0,039.
+
+- **Modelos propios:** se entrenan en la computadora con TensorFlow y se
+  convierten a `.tflite`; en la placa solo se ejecutan.  `tflm-seno` sirve
+  para modelos de 1 entrada y 1 salida (float o int8).
+- **Operadores incluidos:** FullyConnected, Conv2D, DepthwiseConv2D,
+  MaxPool2D, AveragePool2D, Reshape, Softmax, Relu, Relu6, Logistic, Tanh,
+  Add, Mul, Quantize, Dequantize y Mean.  Otro operador se agrega en
+  `registrar()` de `examples/tflm/tflm-seno.cc`.
+- **Para un programa propio**, partí de `tflm-seno.cc`: `make -C
+  examples/tflm` arma `build/libtflm.a` una vez, en ~15 s con 4 núcleos.
+- **Límites:**
+  - un núcleo, sin aceleración vectorial ni NPU;
+  - el modelo y su arena tienen que entrar en la RAM libre (~2–5 MB);
+  - no hay entrenamiento en la placa;
+  - no hay TensorFlow "completo" ni PyTorch.
+
+#### Dejar un servidor corriendo
+
+Los servidores se cortan al cerrar la sesión SSH.  Para que sigan:
+
+```sh
+nohup servidor-web > /home/m5/servidor-web.log 2>&1 &
+```
+
+- Arrancarlos solos al encender no está configurado.
+- Cada servidor ocupa RAM mientras corre: con dos o tres a la vez, revisá
+  `largest_free` en `/sys/kernel/board/nommu_pool` antes de arrancar
+  otro.
+
 ---
 
 ## Anexo A. Qué se hizo y por qué funcionó
