@@ -1189,14 +1189,13 @@ ver-imagen -n /home/m5/imagenes/*.png               # solo tamaño y canales
 - `make deploy` también copia a `/home/m5/imagenes` los dígitos de ejemplo
   de `mnist_lstm` (si bajaste tflite-micro).
 
-Probado en la Mac (mismo código, compilado para macOS):
-- PNG y JPEG de 28×28;
-- JPEG de 640×480 reducido a 80×30;
-- rechazo de 1600×1200;
-- error claro con un archivo que no es imagen.
+Probado en la placa el 2026-11-24 (usa 205 KB de RAM al arrancar):
+- PNG y JPEG de 28×28: 0,01 s;
+- JPEG de 640×480 reducido a 80×30: 0,14 s;
+- rechazo de 1600×1200 con el aviso de arriba;
+- error claro con un archivo que no es imagen (`unknown image type`).
 
-En la placa compila (205 KB de RAM al arrancar) pero **todavía no lo probé**:
-la placa no respondía en la red.
+Un dígito de 28×28 en colores ocupa 9–12 KB de texto por SSH.
 
 #### Dejar un servidor corriendo
 
