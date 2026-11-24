@@ -7,11 +7,12 @@
 //     -n  only print the level once per second, do not write a file
 //
 // Reads /dev/ws-audio (kernel patch 0094): 16 kHz, S16_LE, 2 channels, at
-// most 4080 bytes (63.75 ms) per read.  Each read restarts I2S, so there
-// is a short gap between blocks (~5 ms measured, about 7 %); the WAV is
-// fine to listen to, not yet for sample-exact processing.  The audio is
-// kept in RAM and written at the end.  Prints RMS and peak of the
-// microphone channel once per second.
+// most 4080 bytes (63.75 ms) per read.  The kernel captures continuously
+// from open() to close() (DMA ring, patch 0094) and replaces the stale
+// first FIFO frame, so the WAV has no gaps or clicks.  The audio is kept
+// in RAM and written at the end (writing to the microSD while recording
+// made the reader fall behind).  Prints RMS and peak of the microphone
+// channel once per second.
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -72,6 +73,17 @@ static unsigned long volcar(struct trozo **primero, struct trozo **ultimo, FILE 
   return total;
 }
 
+static FILE *abrir(const char *ruta, unsigned char h[44], int canales) {
+  FILE *out = fopen(ruta, "wb");
+  if (out == NULL) {
+    perror(ruta);
+    return NULL;
+  }
+  cabecera_wav(h, canales, 0);  // rewritten at the end
+  fwrite(h, 1, 44, out);
+  return out;
+}
+
 static double ahora(void) {
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
@@ -98,6 +110,11 @@ int main(int argc, char **argv) {
     return 2;
   }
 
+  // Flush pending microSD writes first, and create the file only after the
+  // recording: an ext4 journal commit over the software SPI holds the only
+  // core for seconds, and the 0.5 s capture ring overflows meanwhile (seen
+  // on the board: 10 s of audio took 14 s, about 4 s lost).
+  sync();
   int fd = open(DISPOSITIVO, O_RDONLY);
   if (fd < 0) {
     fprintf(stderr, "%s: %s (el kernel tiene el driver de audio?)\n", DISPOSITIVO,
@@ -107,15 +124,8 @@ int main(int argc, char **argv) {
   FILE *out = NULL;
   int canales = estereo ? 2 : 1;
   unsigned char h[44];
-  if (!solo_nivel) {
-    out = fopen(argv[optind], "wb");
-    if (out == NULL) {
-      perror(argv[optind]);
-      return 1;
-    }
-    cabecera_wav(h, canales, 0);  // rewritten at the end
-    fwrite(h, 1, 44, out);
-  }
+  int guardar = !solo_nivel;
+  const char *ruta = guardar ? argv[optind] : NULL;
 
   static int16_t bloque[BLOQUE / 2];
   static int16_t mono[BLOQUE / 4];
@@ -136,10 +146,6 @@ int main(int argc, char **argv) {
     }
     int f = (int) (n / 4);
     if (f < 2) continue;
-    // The first frame of every read is a stale I2S FIFO word (measured on
-    // the board: spikes up to -27648 only there).  Repeat frame 1 instead.
-    bloque[0] = bloque[2];
-    bloque[1] = bloque[3];
     if (frames + f > frames_meta) f = (int) (frames_meta - frames);
     for (int i = 0; i < f; i++) {
       int v = bloque[2 * i];  // left = microphone
@@ -149,7 +155,7 @@ int main(int argc, char **argv) {
     }
     frames += f;
     frames_seg += f;
-    if (out) {
+    if (guardar) {
       // Keep the audio in RAM while recording: writing to the microSD
       // (software SPI) between reads made 5 s of audio take 8.5 s, with
       // gaps.  If memory runs out, write what there is and go on.
@@ -160,6 +166,7 @@ int main(int argc, char **argv) {
         if (t == NULL) {
           if (!aviso_memoria++)
             fprintf(stderr, "sin memoria: escribo a la microSD mientras grabo (habra cortes)\n");
+          if (out == NULL && (out = abrir(ruta, h, canales)) == NULL) return 1;
           bytes += volcar(&primero, &ultimo, out);
           fwrite(src, 1, b, out);
           bytes += b;
@@ -192,14 +199,19 @@ int main(int argc, char **argv) {
   }
   double dt = ahora() - t0;
   close(fd);
-  if (out) {
+  double audio_s = (double) frames / TASA;
+  if (frames > 0 && dt > audio_s + 0.5)
+    fprintf(stderr, "aviso: %.1f s de audio en %.1f s: el sistema estuvo ocupado y se perdio "
+            "audio (dmesg: overrun)\n", audio_s, dt);
+  if (guardar) {
+    if (out == NULL && (out = abrir(ruta, h, canales)) == NULL) return 1;
     bytes += volcar(&primero, &ultimo, out);
     cabecera_wav(h, canales, bytes);
     fseek(out, 0, SEEK_SET);
     fwrite(h, 1, 44, out);
     fclose(out);
-    printf("%s: %.1f s de audio en %.1f s, %s, 16 kHz, 16 bits\n", argv[optind],
-           (double) frames / TASA, dt, estereo ? "estereo" : "mono");
+    printf("%s: %.1f s de audio en %.1f s, %s, 16 kHz, 16 bits\n", ruta, audio_s, dt,
+           estereo ? "estereo" : "mono");
   }
   return frames > 0 ? 0 : 1;
 }

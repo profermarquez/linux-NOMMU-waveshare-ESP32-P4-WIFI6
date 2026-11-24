@@ -1258,6 +1258,119 @@ nohup servidor-web > /home/m5/servidor-web.log 2>&1 &
   `largest_free` en `/sys/kernel/board/nommu_pool` antes de arrancar
   otro.
 
+### 11.12 Micrófono y reconocimiento de voz
+
+La placa trae un micrófono analógico soldado, conectado a la entrada del
+códec **ES8311** (I2C 0x18).  El ES8311 manda el audio al P4 por **I2S**:
+MCLK 13, BCLK 12, LRCK 10, DIN 11 (pines del BSP de Waveshare).  Desde el
+2026-11-24 Linux lo puede grabar.  Probado en la placa.
+
+**Hace falta otro firmware.**  Las imágenes de `firmware/` de este
+repositorio **no** traen el audio.  Se agregan tres piezas:
+
+| Dirección | Pieza | Qué hace |
+|---|---|---|
+| 0x10000 | boot shim con `ws_audio.c` | configura el ES8311 (ganancia 24 dB) e I2S1 como receptor maestro; mide el nivel del micrófono al arrancar |
+| 0x90000 | kernel con el parche 0094 | `/dev/ws-audio`: captura continua, 16 kHz, 16 bits, estéreo (el micrófono es el canal izquierdo) |
+| 0xF10000 | DTB con el nodo `audio@500c7000` | — |
+
+El rootfs, el bootloader, la tabla de particiones, `/boot` y el C6 no
+cambian.  Las fuentes están en `source/0002-waveshare-audio.patch`, que se
+aplica sobre la v2.
+
+**Al arrancar**, la consola serie muestra el nivel del micrófono, medido
+por el shim antes de Linux:
+
+```
+ws_audio: mic L rms=107 peak=326 dc=0 (6400 frames, gain 24 dB)
+ws_audio: I2S1 RX master + ES8311 ADC ready for Linux: 16 kHz S16_LE stereo, mic gain 24 dB
+```
+
+Un micrófono que no funciona da valores cerca de 0 o fijos.
+
+#### Grabar (`grabar`)
+
+```bash
+make -C examples/audio deploy PLACA=stamp-p4.local      # desde la Mac
+```
+
+```sh
+grabar -s 10 /home/m5/voz.wav     # 10 s, mono, 16 kHz; muestra el nivel cada segundo
+grabar -n -s 30                   # solo el medidor de nivel, sin archivo
+grabar -e -s 5 estereo.wav        # los dos canales (el derecho repite el izquierdo)
+```
+
+```bash
+scp -O m5@stamp-p4.local:/home/m5/voz.wav . && afplay voz.wav   # escucharlo en la Mac
+```
+
+Probado en la placa:
+- tres grabaciones seguidas de 10 s dieron 10,0 s de audio en 10,0 s;
+- sin cortes: el salto medio entre muestras es 5,5 en los bordes de bloque
+  y 5,1 adentro;
+- sin clics.
+
+- `grabar` guarda el audio en RAM y crea el archivo **al terminar**.
+  Antes de grabar vacía las escrituras pendientes de la microSD (`sync`).
+- **Escribir en la microSD mientras se graba hace perder audio:** el diario
+  de ext4 ocupa el único núcleo por unos segundos.  En una prueba, 10 s de
+  audio tardaron 14 s, y se perdieron unos 4 s.
+- Si eso pasa, `grabar` avisa, y el kernel lo anota (`dmesg | grep
+  overrun`).
+
+#### Decir "yes" o "no" (`tflm-voz`)
+
+Es el ejemplo `micro_speech` de TensorFlow Lite Micro, con dos modelos:
+- un preprocesador (FFT, banco de filtros, reducción de ruido) que cada
+  20 ms da 40 valores;
+- un clasificador que mira el último segundo y elige entre silencio,
+  desconocido, "yes" y "no".
+
+```bash
+make -C examples/tflm deploy PLACA=stamp-p4.local       # también copia WAVs de prueba a /home/m5/audio
+```
+
+```sh
+tflm-voz /home/m5/audio/yes_1000ms.wav /home/m5/audio/no_1000ms.wav   # archivos WAV de 1 s
+tflm-voz -m                     # escuchar el micrófono; Ctrl+C para salir
+tflm-voz -m -s 30 -v -u 0.7     # 30 s, mostrando cada resultado, umbral 70 %
+```
+
+Probado en la placa con los WAV del ejemplo:
+
+| Archivo | Resultado |
+|---|---|
+| `yes_1000ms.wav` | **yes** (100 %) |
+| `no_1000ms.wav` | **no** (95 %) |
+| `silence_1000ms.wav` | **silencio** (34 %, el más alto) |
+| `noise_1000ms.wav` | **silencio** (97 %) |
+
+Con el micrófono:
+- cada fila de 20 ms tarda 0,41 ms y cada clasificación 62 ms;
+- clasifica cada 200 ms, o sea ~30 % de la CPU;
+- avisa cuando "yes" o "no" pasa el umbral (80 % por defecto).
+
+**Sin probar todavía:** que reconozca a una persona hablándole a la placa.
+En la sala en silencio marcó sobre todo "desconocido" (0,4–0,9), no
+"silencio".  Puede ser el nivel del micrófono, distinto al de los datos de
+entrenamiento.
+
+#### Límites
+
+- **Solo grabar:** el I2S está como receptor; el parlante (DAC del ES8311 y
+  amplificador en GPIO53) no está configurado.
+- **Un programa a la vez** puede leer `/dev/ws-audio` (otro recibe
+  `EBUSY`).
+- **El modelo de voz solo conoce "yes" y "no"** en inglés.  Para otras
+  palabras hay que entrenar un modelo en la computadora.
+- **Un `tflm-voz -m -v` mostró 2 pérdidas de audio en 10 s** la primera
+  vez; las corridas siguientes no.  No sé la causa.
+- Conviene no grabar mientras otro programa escribe mucho en la microSD.
+
+**Volver al sistema sin audio:** grabar el shim de la v2 en 0x10000 y el
+`Image` y el DTB de `firmware/` en 0x90000 y 0xF10000 (o `./flash.sh`, que
+también borra `/boot`).
+
 ---
 
 ## Anexo A. Qué se hizo y por qué funcionó

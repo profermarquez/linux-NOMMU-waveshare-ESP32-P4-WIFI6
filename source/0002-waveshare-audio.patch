@@ -1,0 +1,1052 @@
+Microfono del ES8311 (Waveshare ESP32-P4-WIFI6) sobre la v2.
+
+Aplicar sobre el arbol de la v2 (0001-waveshare-esp32-p4-wifi6-v2.patch sobre 69a7312).
+Falta la biblioteca esp_codec_dev 1.4.0 (Apache-2.0, del registro de componentes de
+Espressif, https://components.espressif.com/components/espressif/esp_codec_dev), que va
+copiada en linux/boot-shim/components/esp_codec_dev/ (sin test_apps).
+Commits: 72295d0 0e9f661 7dc4b71 f2f4788 71db1f8 
+
+diff --git a/linux/boot-shim/main/CMakeLists.txt b/linux/boot-shim/main/CMakeLists.txt
+index ad265dc..14fae66 100644
+--- a/linux/boot-shim/main/CMakeLists.txt
++++ b/linux/boot-shim/main/CMakeLists.txt
+@@ -15,6 +15,11 @@ idf_component_register(
+ )
+ if("$ENV{BOARD}" STREQUAL "waveshare")
+     target_compile_definitions(${COMPONENT_LIB} PRIVATE BOARD_WAVESHARE=1)
++    # ES8311 + I2S1 setup and microphone check (WS_AUDIO=0 leaves it out).
++    if(NOT "$ENV{WS_AUDIO}" STREQUAL "0")
++        target_sources(${COMPONENT_LIB} PRIVATE "ws_audio.c")
++        target_compile_definitions(${COMPONENT_LIB} PRIVATE WS_AUDIO=1)
++    endif()
+ endif()
+ 
+ # Build identification (#22): the git revision is printed at boot.
+diff --git a/linux/boot-shim/main/main.c b/linux/boot-shim/main/main.c
+index cc7b49c..ca15535 100644
+--- a/linux/boot-shim/main/main.c
++++ b/linux/boot-shim/main/main.c
+@@ -69,6 +69,9 @@
+ #include "driver/gpio.h"
+ #include "boot_ab.h"
+ #include "deep_sleep.h"
++#ifdef WS_AUDIO
++#include "ws_audio.h"
++#endif
+ 
+ static void usb_otg_init(void)
+ {
+@@ -741,6 +744,11 @@ void app_main(void)
+ 	/* M2 opts in to the raw Slot 1 bootstrap; M1 keeps the proven path. */
+ 	m2_sdmmc_init();
+ 	#endif
++#ifdef WS_AUDIO
++	/* ES8311 + I2S1 for Linux, plus a 0.5 s microphone level check on the
++	 * console.  Never fatal. */
++	ws_audio_init();
++#endif
+ 	/* Enable Full-Speed USB OTG (DWC2) for Type-A USB Gadget */
+ #ifndef BOARD_WAVESHARE
+ 	/* Stamp carrier USB-A gadget on GPIO26/27; on Waveshare those pins
+diff --git a/linux/boot-shim/main/ws_audio.c b/linux/boot-shim/main/ws_audio.c
+new file mode 100644
+index 0000000..779bda9
+--- /dev/null
++++ b/linux/boot-shim/main/ws_audio.c
+@@ -0,0 +1,306 @@
++// SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-only
++/*
++ * Waveshare ESP32-P4-WIFI6: prepare the ES8311 codec and I2S1 for Linux and
++ * check the on-board microphone before the jump.
++ *
++ * Wiring (Waveshare BSP waveshare/esp32_p4_platform 2.0.1, header
++ * esp32_p4_platform.h, and its 12_I2SCodec example):
++ *   I2C (codec control): SDA GPIO7, SCL GPIO8, ES8311 at 0x18
++ *   I2S: MCLK 13, BCLK 12, LRCK 10, DOUT 9 (to DSDIN, unused for now), DIN 11
++ *   Power amplifier enable: GPIO53, active high (kept OFF here)
++ *   Microphone: analog, into the ES8311 ADC (digital_mic = false)
++ *
++ * ESP-IDF owns the clock and GPIO-matrix setup.  Linux inherits the
++ * configured I2S1 registers; its small audio driver (linux-waveshare-xc's
++ * esp32p4-xc-audio, adapted) only starts/stops transfers on AHB-GDMA
++ * channel 2.  As in that project, the I2S channels are disabled before the
++ * jump so no ESP-IDF DMA or interrupt stays active, and GPIO7/8 are handed
++ * back as plain GPIO so Linux's i2c-gpio bus keeps working.
++ *
++ * Before releasing everything this records MIC_TEST_MS of audio and logs
++ * the level of each channel, so the serial console shows whether the
++ * microphone works without any Linux driver:
++ *   ws_audio: mic L rms=... peak=... dc=...  R rms=... peak=...
++ */
++#include <stdint.h>
++#include <stdlib.h>
++#include <math.h>
++#include <inttypes.h>
++
++#include "driver/gpio.h"
++#include "driver/i2c_master.h"
++#include "driver/i2s_std.h"
++#include "esp_codec_dev.h"
++#include "esp_codec_dev_defaults.h"
++#include "esp_log.h"
++#include "esp_rom_gpio.h"
++#include "soc/gpio_sig_map.h"
++
++#include "ws_audio.h"
++
++#define WS_I2C_PORT	I2C_NUM_1
++#define WS_I2C_SDA	GPIO_NUM_7
++#define WS_I2C_SCL	GPIO_NUM_8
++#define WS_I2S_PORT	I2S_NUM_1
++#define WS_I2S_MCLK	GPIO_NUM_13
++#define WS_I2S_BCLK	GPIO_NUM_12
++#define WS_I2S_WS	GPIO_NUM_10
++#define WS_I2S_DOUT	GPIO_NUM_9
++#define WS_I2S_DIN	GPIO_NUM_11
++#define WS_PA_ENABLE	GPIO_NUM_53
++
++#define WS_RATE		16000
++#define WS_CHANNELS	2
++#define WS_BITS		16
++#define WS_MIC_GAIN_DB	24.0f	/* Waveshare BSP default */
++#define MIC_TEST_MS	500
++#define MIC_SKIP_MS	100	/* ADC start-up transient */
++#define MIC_CHUNK	3200	/* 50 ms of stereo S16 */
++
++static const char *TAG = "ws_audio";
++static i2s_chan_handle_t rx_chan;
++static i2c_master_bus_handle_t i2c_bus;
++static esp_codec_dev_handle_t codec;
++
++static void pa_off(void)
++{
++	const gpio_config_t cfg = {
++		.pin_bit_mask = 1ULL << WS_PA_ENABLE,
++		.mode = GPIO_MODE_OUTPUT,
++		.pull_up_en = GPIO_PULLUP_DISABLE,
++		.pull_down_en = GPIO_PULLDOWN_DISABLE,
++		.intr_type = GPIO_INTR_DISABLE,
++	};
++
++	gpio_config(&cfg);
++	gpio_set_level(WS_PA_ENABLE, 0);
++}
++
++static void release_i2c_pins(void)
++{
++	const gpio_num_t pins[] = { WS_I2C_SDA, WS_I2C_SCL };
++
++	/* Linux drives GPIO7/8 as a bit-banged I2C bus (/dev/i2c-0).  Put the
++	 * GPIO matrix back to plain GPIO, inputs with pull-ups (bus idle). */
++	for (unsigned int i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
++		esp_rom_gpio_connect_out_signal(pins[i], SIG_GPIO_OUT_IDX, false, false);
++		gpio_set_direction(pins[i], GPIO_MODE_INPUT);
++		gpio_set_pull_mode(pins[i], GPIO_PULLUP_ONLY);
++	}
++}
++
++static esp_err_t init_i2s(void)
++{
++	i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(WS_I2S_PORT, I2S_ROLE_MASTER);
++	i2s_std_config_t std_cfg = {
++		.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(WS_RATE),
++		.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
++								I2S_SLOT_MODE_STEREO),
++		.gpio_cfg = {
++			.mclk = WS_I2S_MCLK,
++			.bclk = WS_I2S_BCLK,
++			.ws = WS_I2S_WS,
++			.dout = I2S_GPIO_UNUSED,	/* capture only for now */
++			.din = WS_I2S_DIN,
++		},
++	};
++	esp_err_t err;
++
++	std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
++
++	/*
++	 * RX only (simplex), as master: RX then generates BCLK/LRCK and MCLK
++	 * itself.  A full-duplex pair makes RX a slave of TX (rx_slave_mod,
++	 * tx_conf.sig_loopback), and under Linux, with no TX data, TX stays
++	 * idle and RX never gets a clock: every /dev/ws-audio read timed out
++	 * on the board (even with TX started and tx_stop_en = 0).
++	 */
++	err = i2s_new_channel(&chan_cfg, NULL, &rx_chan);
++	if (err == ESP_OK)
++		err = i2s_channel_init_std_mode(rx_chan, &std_cfg);
++	if (err == ESP_OK)
++		err = i2s_channel_enable(rx_chan);
++	return err;
++}
++
++static esp_err_t init_i2c(void)
++{
++	const i2c_master_bus_config_t cfg = {
++		.i2c_port = WS_I2C_PORT,
++		.sda_io_num = WS_I2C_SDA,
++		.scl_io_num = WS_I2C_SCL,
++		.clk_source = I2C_CLK_SRC_DEFAULT,
++		.glitch_ignore_cnt = 7,
++		.flags.enable_internal_pullup = true,
++	};
++
++	return i2c_new_master_bus(&cfg, &i2c_bus);
++}
++
++static esp_err_t init_codec(void)
++{
++	const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
++	audio_codec_i2s_cfg_t data_cfg = {
++		.port = WS_I2S_PORT,
++		.rx_handle = rx_chan,
++		.tx_handle = NULL,
++	};
++	const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&data_cfg);
++	audio_codec_i2c_cfg_t i2c_cfg = {
++		.port = WS_I2C_PORT,
++		.addr = ES8311_CODEC_DEFAULT_ADDR,
++		.bus_handle = i2c_bus,
++	};
++	const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
++	es8311_codec_cfg_t es_cfg = {
++		.ctrl_if = ctrl_if,
++		.gpio_if = gpio_if,
++		.codec_mode = ESP_CODEC_DEV_WORK_MODE_ADC,
++		.pa_pin = -1,		/* amplifier stays off (pa_off) */
++		.master_mode = false,
++		.use_mclk = true,
++		.digital_mic = false,	/* analog microphone (Waveshare BSP) */
++		.no_dac_ref = true,	/* right channel not filled with DAC output */
++		.mclk_div = I2S_MCLK_MULTIPLE_256,
++		.hw_gain = {
++			.pa_voltage = 5.0,
++			.codec_dac_voltage = 3.3,
++		},
++	};
++	esp_codec_dev_sample_info_t sample = {
++		.sample_rate = WS_RATE,
++		.channel = WS_CHANNELS,
++		.bits_per_sample = WS_BITS,
++	};
++	const audio_codec_if_t *codec_if;
++	esp_codec_dev_cfg_t dev_cfg;
++
++	if (!gpio_if || !data_if || !ctrl_if)
++		return ESP_ERR_NO_MEM;
++	codec_if = es8311_codec_new(&es_cfg);
++	if (!codec_if)
++		return ESP_ERR_NOT_FOUND;	/* usually: no ACK at 0x18 */
++	dev_cfg = (esp_codec_dev_cfg_t) {
++		.dev_type = ESP_CODEC_DEV_TYPE_IN,
++		.codec_if = codec_if,
++		.data_if = data_if,
++	};
++	codec = esp_codec_dev_new(&dev_cfg);
++	if (!codec)
++		return ESP_ERR_NO_MEM;
++	if (esp_codec_dev_open(codec, &sample) != ESP_CODEC_DEV_OK)
++		return ESP_FAIL;
++	esp_codec_dev_set_in_gain(codec, WS_MIC_GAIN_DB);
++	return ESP_OK;
++}
++
++/* Record MIC_TEST_MS and log RMS, peak and DC offset of both channels. */
++static void mic_level_test(void)
++{
++	int16_t *buf = malloc(MIC_CHUNK);
++	const int total = WS_RATE * MIC_TEST_MS / 1000;	/* frames */
++	const int skip = WS_RATE * MIC_SKIP_MS / 1000;
++	int64_t sum[2] = { 0, 0 };
++	double sq[2] = { 0, 0 };
++	int peak[2] = { 0, 0 };
++	int frames = 0, seen = 0;
++
++	if (!buf) {
++		ESP_LOGW(TAG, "mic test: no memory");
++		return;
++	}
++	while (seen < total) {
++		if (esp_codec_dev_read(codec, buf, MIC_CHUNK) != ESP_CODEC_DEV_OK) {
++			ESP_LOGW(TAG, "mic test: read failed after %d frames", seen);
++			break;
++		}
++		for (int i = 0; i < MIC_CHUNK / 4 && seen < total; i++, seen++) {
++			if (seen < skip)
++				continue;
++			for (int c = 0; c < 2; c++) {
++				int v = buf[2 * i + c];
++				sum[c] += v;
++				sq[c] += (double)v * v;
++				if (abs(v) > peak[c])
++					peak[c] = abs(v);
++			}
++			frames++;
++		}
++	}
++	free(buf);
++	if (frames == 0)
++		return;
++	for (int c = 0; c < 2; c++) {
++		double mean = (double)sum[c] / frames;
++		double var = sq[c] / frames - mean * mean;
++
++		ESP_LOGI(TAG, "mic %c rms=%d peak=%d dc=%d (%d frames, gain %.0f dB)",
++			 c ? 'R' : 'L', (int)sqrt(var > 0 ? var : 0), peak[c],
++			 (int)mean, frames, WS_MIC_GAIN_DB);
++	}
++}
++
++/*
++ * ESP-IDF's I2S driver took an AHB-GDMA channel for I2S1 (channel 0 on the
++ * board) and leaves its peripheral selector pointing at I2S1 after the
++ * channel is disabled.  The Linux driver uses channel 2; with two channels
++ * selecting I2S1 the data went to IDF's idle channel and every Linux read
++ * timed out (I2S INT_RAW rx_done + rx_hung, ch2 never got a byte).  Point
++ * every other AHB-GDMA channel that still selects I2S1 back to "none".
++ */
++#define AHB_DMA_BASE		0x50085000u
++#define AHB_DMA_CH_STRIDE	0xc0u
++#define AHB_DMA_IN_PERI_SEL	0x0a0u	/* channel 0; + n * stride */
++#define AHB_DMA_OUT_PERI_SEL	0x100u
++#define GDMA_PERI_NONE		0x3fu
++#define GDMA_PERI_I2S1		4u	/* SOC_GDMA_TRIG_PERIPH_I2S1 */
++#define LINUX_AUDIO_DMA_CH	2u
++
++static void release_idf_dma(void)
++{
++	for (uint32_t ch = 0; ch < 3; ch++) {
++		const uint32_t offs[2] = { AHB_DMA_IN_PERI_SEL, AHB_DMA_OUT_PERI_SEL };
++
++		if (ch == LINUX_AUDIO_DMA_CH)
++			continue;
++		for (int d = 0; d < 2; d++) {
++			volatile uint32_t *sel = (volatile uint32_t *)(uintptr_t)
++				(AHB_DMA_BASE + offs[d] + ch * AHB_DMA_CH_STRIDE);
++
++			if ((*sel & 0x3f) == GDMA_PERI_I2S1) {
++				*sel = GDMA_PERI_NONE;
++				ESP_LOGI(TAG, "AHB-GDMA ch%" PRIu32 " %s: I2S1 selector released for Linux (ch%u)",
++					 ch, d ? "out" : "in", LINUX_AUDIO_DMA_CH);
++			}
++		}
++	}
++}
++
++esp_err_t ws_audio_init(void)
++{
++	esp_err_t err;
++
++	pa_off();
++	err = init_i2s();
++	if (err == ESP_OK)
++		err = init_i2c();
++	if (err == ESP_OK)
++		err = init_codec();
++	if (err == ESP_OK)
++		mic_level_test();
++
++	/* Keep the register and IO-matrix setup, leave no live IDF transfer. */
++	if (rx_chan)
++		i2s_channel_disable(rx_chan);
++	release_idf_dma();
++	if (i2c_bus)
++		release_i2c_pins();
++
++	if (err == ESP_OK)
++		ESP_LOGI(TAG, "I2S1 RX master + ES8311 ADC ready for Linux: 16 kHz S16_LE stereo, mic gain %.0f dB",
++			 WS_MIC_GAIN_DB);
++	else
++		ESP_LOGW(TAG, "audio preparation failed: %s; continuing Linux boot",
++			 esp_err_to_name(err));
++	return err;
++}
+diff --git a/linux/boot-shim/main/ws_audio.h b/linux/boot-shim/main/ws_audio.h
+new file mode 100644
+index 0000000..c3179b3
+--- /dev/null
++++ b/linux/boot-shim/main/ws_audio.h
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-only
++#pragma once
++
++#include "esp_err.h"
++
++/* Waveshare ESP32-P4-WIFI6: ES8311 + I2S1 setup and microphone level test
++ * before the Linux jump.  Never fatal: on error it logs and returns. */
++esp_err_t ws_audio_init(void);
+diff --git a/linux/boot-shim/sdkconfig-waveshare.defaults b/linux/boot-shim/sdkconfig-waveshare.defaults
+index 1948adf..1a40db0 100644
+--- a/linux/boot-shim/sdkconfig-waveshare.defaults
++++ b/linux/boot-shim/sdkconfig-waveshare.defaults
+@@ -6,3 +6,17 @@ CONFIG_ESP32P4_REV_MIN_300=y
+ CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+ CONFIG_ESPTOOLPY_FLASHSIZE="32MB"
+ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-waveshare.csv"
++# Audio (ws_audio.c): esp_codec_dev with only the ES8311 driver, new I2C API.
++CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=n
++CONFIG_CODEC_ES8311_SUPPORT=y
++CONFIG_CODEC_ES7210_SUPPORT=n
++CONFIG_CODEC_ES7243_SUPPORT=n
++CONFIG_CODEC_ES7243E_SUPPORT=n
++CONFIG_CODEC_ES8156_SUPPORT=n
++CONFIG_CODEC_AW88298_SUPPORT=n
++CONFIG_CODEC_ES8389_SUPPORT=n
++CONFIG_CODEC_ES8374_SUPPORT=n
++CONFIG_CODEC_ES8388_SUPPORT=n
++CONFIG_CODEC_TAS5805M_SUPPORT=n
++CONFIG_CODEC_ZL38063_SUPPORT=n
++CONFIG_CODEC_CJC8910_SUPPORT=n
+diff --git a/linux/build-m1.sh b/linux/build-m1.sh
+index 3bb7f94..0522104 100755
+--- a/linux/build-m1.sh
++++ b/linux/build-m1.sh
+@@ -860,6 +860,11 @@ patches+=(0092-physmap-exact-size.patch)
+ # #56: /sys/kernel/board/deep_sleep, wake_reason, wake_info and
+ # sleep_memory; the boot shim does the sleep itself.
+ patches+=(0093-esp32p4-deep-sleep.patch)
++# Waveshare: ES8311 PCM device /dev/ws-audio (the boot shim's ws_audio.c
++# sets up the codec and I2S1).  WS_AUDIO=0 leaves it out.
++if [[ "${BOARD:-}" == waveshare && "${WS_AUDIO:-1}" != "0" ]]; then
++	patches+=(0094-esp32p4-waveshare-audio.patch)
++fi
+ # C67-L2-STAGE: observe-only SMP breadcrumbs in smpboot.c (no behaviour change).
+ if [[ "${C67_SMP_STAGE:-0}" == "1" || "${C68_CLEAN_RELEASE:-0}" == "1" ]]; then
+ 	patches+=(0037-c67-l2-stage-smpboot.patch)
+@@ -1200,6 +1205,9 @@ if $lab_profile; then
+ fi
+ if [[ "${BOARD:-}" == waveshare ]]; then
+ 	cat "${firmware_root}/linux/waveshare/kernel.config.fragment" >>"${kernel_config_fragment}"
++	if [[ "${WS_AUDIO:-1}" != "0" ]]; then
++		printf '%s\n' "CONFIG_ESP32P4_WS_AUDIO=y" >>"${kernel_config_fragment}"
++	fi
+ fi
+ if [[ -n "$pstore_identity" ]]; then
+ 	cat >>"${kernel_config_fragment}" <<'EOF'
+diff --git a/linux/dts/esp32p4-m5stamp-p4.dts b/linux/dts/esp32p4-m5stamp-p4.dts
+index 259e4eb..645675b 100644
+--- a/linux/dts/esp32p4-m5stamp-p4.dts
++++ b/linux/dts/esp32p4-m5stamp-p4.dts
+@@ -317,6 +317,22 @@
+ 			status = "disabled";
+ 		};
+ 
++		/*
++		 * Waveshare: ES8311 codec PCM (/dev/ws-audio, kernel patch 0094).
++		 * The boot shim (ws_audio.c) sets up the codec, the I2S pins
++		 * (MCLK 13, BCLK 12, LRCK 10, DOUT 9, DIN 11: reserved in gpio0)
++		 * and I2S1; Linux uses I2S1, AHB-GDMA channel 2 and the I2S1/PDMA
++		 * clock gates in HP_SYS_CLKRST.
++		 */
++		ws_audio: audio@500c7000 {
++			compatible = "waveshare,esp32p4-wifi6-audio";
++			reg = <0x500c7000 0x1000>,
++			      <0x50085000 0x1000>,
++			      <0x500e6000 0x1000>;
++			reg-names = "i2s", "ahb-dma", "clkrst";
++			status = "okay";
++		};
++
+ 		/* Patched at runtime by boot-shim/main.c with the flash MMU VA. */
+ 		flash@deadbeef {
+ 			compatible = "mtd-rom";
+diff --git a/linux/kernel-patches/0094-esp32p4-waveshare-audio.patch b/linux/kernel-patches/0094-esp32p4-waveshare-audio.patch
+new file mode 100644
+index 0000000..57b0cc8
+--- /dev/null
++++ b/linux/kernel-patches/0094-esp32p4-waveshare-audio.patch
+@@ -0,0 +1,595 @@
++Waveshare ESP32-P4-WIFI6: ES8311 PCM device /dev/ws-audio (continuous capture).
++
++Adapted from linux-waveshare-xc's esp32p4-xc-audio (patch 0043 there).
++The boot shim (ws_audio.c) configures the codec and I2S1.
++
++--- a/drivers/misc/Kconfig
+++++ b/drivers/misc/Kconfig
++@@ -655,6 +655,15 @@
++ 	  boot shim, which turns the C6 off and puts the chip into Deep
++ 	  Sleep until a timer or LP GPIO wakes it.
++ 
+++config ESP32P4_WS_AUDIO
+++	bool "Waveshare ESP32-P4-WIFI6: ES8311 PCM device (/dev/ws-audio)"
+++	depends on SOC_ESP32P4 && !MMU
+++	help
+++	  Minimal read/write PCM device for the ES8311 codec of the Waveshare
+++	  ESP32-P4-WIFI6: 16 kHz, S16_LE, two channels, microphone on the
+++	  left.  The boot shim configures the codec and I2S1; Linux only
+++	  starts and stops transfers on AHB-GDMA channel 2.
+++
++ source "drivers/misc/c2port/Kconfig"
++ source "drivers/misc/eeprom/Kconfig"
++ source "drivers/misc/cb710/Kconfig"
++--- a/drivers/misc/Makefile
+++++ b/drivers/misc/Makefile
++@@ -76,3 +76,4 @@
++ obj-$(CONFIG_MISC_RP1)		+= rp1/
++ obj-$(CONFIG_ESP32P4_BOOTFLASH)	+= esp32p4-bootflash.o
++ obj-$(CONFIG_ESP32P4_SLEEP)	+= esp32p4-sleep.o
+++obj-$(CONFIG_ESP32P4_WS_AUDIO)	+= esp32p4-ws-audio.o
++--- /dev/null
+++++ b/drivers/misc/esp32p4-ws-audio.c
++@@ -0,0 +1,562 @@
+++// SPDX-License-Identifier: GPL-2.0
+++/*
+++ * Lightweight PCM driver for the Waveshare ESP32-P4-WIFI6 (ES8311 codec).
+++ *
+++ * Adapted from linux-waveshare-xc's esp32p4-xc-audio (Waveshare XC boards,
+++ * ES8311 + ES7210; written but never tested on hardware there).  On the
+++ * WIFI6 board the ES8311 alone does both directions: its analog microphone
+++ * input comes back on I2S DIN (GPIO11).
+++ *
+++ * The ESP-IDF boot shim (ws_audio.c) configures the I2S pin matrix, I2S1
+++ * clocks/slots and the codec, then disables its I2S channels before the
+++ * jump.  Linux keeps that configuration and owns I2S1 plus AHB-GDMA channel
+++ * pair 2.  The userspace ABI is fixed and tiny: read /dev/ws-audio,
+++ * S16_LE, 16000 Hz, two interleaved channels (the microphone is the left
+++ * one).
+++ *
+++ * Capture is continuous: open() starts I2S RX and a circular ring of
+++ * WS_RING_N DMA descriptors (one 4080-byte block = 63.75 ms each), the way
+++ * ESP-IDF's own I2S driver does it; read() copies completed blocks, found
+++ * through the DMA's "last EOF descriptor" register, and close() stops it.
+++ * There is no interrupt: read() sleeps in 2 ms steps while it waits.  If the
+++ * reader falls more than the ring behind, the oldest audio is lost: read()
+++ * resynchronises and the count is logged at close().  The first frame after start is a stale FIFO word and is replaced
+++ * by the second.  Only one reader at a time (-EBUSY).
+++ *
+++ * write() is the old one-shot path (one block per call, I2S restarted):
+++ * the shim currently sets I2S1 up for RX only, so playback is not wired.
+++ */
+++
+++#include <linux/bitops.h>
+++#include <linux/delay.h>
+++#include <linux/fs.h>
+++#include <linux/io.h>
+++#include <linux/iopoll.h>
+++#include <linux/miscdevice.h>
+++#include <linux/module.h>
+++#include <linux/mutex.h>
+++#include <linux/of.h>
+++#include <linux/platform_device.h>
+++#include <linux/slab.h>
+++#include <linux/uaccess.h>
+++#include <linux/atomic.h>
+++#include <linux/jiffies.h>
+++#include <linux/sched/signal.h>
+++
+++#define WS_AUDIO_RATE		16000
+++#define WS_AUDIO_CHANNELS	2
+++#define WS_AUDIO_BITS		16
+++#define WS_AUDIO_MAX_IO		4080
+++
+++#define I2S_RX_CONF		0x020
+++#define I2S_TX_CONF		0x024
+++#define I2S_RX_EOF_NUM		0x064
+++#define I2S_CONF_RESET		BIT(0)
+++#define I2S_CONF_FIFO_RESET	BIT(1)
+++#define I2S_CONF_START		BIT(2)
+++#define I2S_CONF_UPDATE		BIT(8)
+++
+++#define DMA_IN_INT_RAW_CH2	0x020
+++#define DMA_IN_INT_CLR_CH2	0x02c
+++#define DMA_OUT_INT_RAW_CH2	0x050
+++#define DMA_OUT_INT_CLR_CH2	0x05c
+++#define DMA_MISC_CONF		0x064
+++#define DMA_IN_CONF0_CH2	0x1f0
+++#define DMA_IN_CONF1_CH2	0x1f4
+++#define DMA_IN_LINK_CH2		0x200
+++#define DMA_IN_PERI_SEL_CH2	0x220
+++#define DMA_OUT_CONF0_CH2	0x250
+++#define DMA_OUT_CONF1_CH2	0x254
+++#define DMA_OUT_LINK_CH2	0x260
+++#define DMA_OUT_PERI_SEL_CH2	0x280
+++#define DMA_IN_SUC_EOF_DES_ADDR_CH2	0x208
+++#define DMA_IN_LINK_ADDR_CH2	0x3b4
+++#define DMA_OUT_LINK_ADDR_CH2	0x3c0
+++#define DMA_ARB_CONF		0x404
+++
+++#define DMA_IN_DONE		BIT(1)
+++#define DMA_IN_SUC_EOF		BIT(1)
+++#define DMA_IN_DESC_ERR		BIT(3)
+++#define DMA_OUT_DESC_ERR	BIT(2)
+++#define DMA_OUT_DONE		BIT(3)
+++#define DMA_CONF_RESET		BIT(0)
+++#define DMA_OWNER_CHECK		BIT(12)
+++#define DMA_IN_LINK_STOP	BIT(1)
+++#define DMA_IN_LINK_START	BIT(2)
+++#define DMA_OUT_LINK_STOP	BIT(0)
+++#define DMA_OUT_LINK_START	BIT(1)
+++#define DMA_I2S1_TRIGGER	4
+++
+++#define CLKRST_SOC_CLK_CTRL1	0x018
+++#define CLKRST_SOC_CLK_CTRL2	0x01c
+++#define CLKRST_PERI_CLK_CTRL14	0x050
+++#define CLKRST_PERI_CLK_CTRL15	0x054
+++#define CLKRST_AHB_PDMA_CLK	BIT(3)
+++#define CLKRST_I2S1_APB_CLK	BIT(15)
+++#define CLKRST_I2S1_RX_CLK	BIT(20)
+++#define CLKRST_I2S1_TX_CLK	BIT(28)
+++
+++/* P4 ROM cache helpers: Cache_WriteBack_Addr / Cache_Invalidate_Addr, the
+++ * same address in esp32p4.rom.ld and esp32p4.rom.eco5.ld (chip v3.x). */
+++#define ESP32P4_CACHE_MAP_L1D_L2 0x30
+++typedef int (*esp32p4_cache_op_t)(u32 map, u32 addr, u32 size);
+++#define esp32p4_cache_writeback ((esp32p4_cache_op_t)0x4fc003f4)
+++#define esp32p4_cache_invalidate ((esp32p4_cache_op_t)0x4fc003e4)
+++
+++struct ws_dma_desc {
+++	u32 control;
+++	u32 buffer;
+++	u32 next;
+++};
+++
+++/* Capture ring: 8 x 63.75 ms = 510 ms of slack for the reader. */
+++#define WS_RING_N		8
+++#define WS_RING_STRIDE		4096	/* cache-line aligned slots */
+++#define WS_BLOCK_JIFFIES	msecs_to_jiffies(64)
+++
+++struct ws_audio {
+++	struct device *dev;
+++	void __iomem *i2s;
+++	void __iomem *dma;
+++	void __iomem *clkrst;
+++	struct miscdevice miscdev;
+++	struct mutex lock; /* serializes the buffer and the DMA channel pair */
+++	struct ws_dma_desc *desc;
+++	u8 *buffer;
+++	/* continuous capture */
+++	struct ws_dma_desc *rdesc;	/* WS_RING_N descriptors */
+++	u8 *ring;			/* WS_RING_N * WS_RING_STRIDE bytes */
+++	atomic_t busy;			/* one opener at a time */
+++	bool running;
+++	bool first_block;
+++	unsigned int cons;		/* next ring slot to hand out */
+++	unsigned int cons_off;		/* bytes of that slot already read */
+++	unsigned long last_progress;	/* jiffies of the last consumed block */
+++	unsigned long overruns;
+++};
+++
+++static void ws_cache_writeback(const void *addr, size_t size)
+++{
+++	esp32p4_cache_writeback(ESP32P4_CACHE_MAP_L1D_L2, (u32)(uintptr_t)addr, size);
+++}
+++
+++static void ws_cache_invalidate(const void *addr, size_t size)
+++{
+++	esp32p4_cache_invalidate(ESP32P4_CACHE_MAP_L1D_L2, (u32)(uintptr_t)addr, size);
+++}
+++
+++static void ws_enable_clocks(struct ws_audio *audio)
+++{
+++	u32 value;
+++
+++	value = readl(audio->clkrst + CLKRST_SOC_CLK_CTRL1);
+++	writel(value | CLKRST_AHB_PDMA_CLK, audio->clkrst + CLKRST_SOC_CLK_CTRL1);
+++	value = readl(audio->clkrst + CLKRST_SOC_CLK_CTRL2);
+++	writel(value | CLKRST_I2S1_APB_CLK, audio->clkrst + CLKRST_SOC_CLK_CTRL2);
+++	value = readl(audio->clkrst + CLKRST_PERI_CLK_CTRL14);
+++	writel(value | CLKRST_I2S1_RX_CLK, audio->clkrst + CLKRST_PERI_CLK_CTRL14);
+++	value = readl(audio->clkrst + CLKRST_PERI_CLK_CTRL15);
+++	writel(value | CLKRST_I2S1_TX_CLK, audio->clkrst + CLKRST_PERI_CLK_CTRL15);
+++
+++	value = readl(audio->dma + DMA_MISC_CONF);
+++	writel(value | BIT(3), audio->dma + DMA_MISC_CONF);
+++	value = readl(audio->dma + DMA_ARB_CONF);
+++	writel(value | BIT(27) | BIT(28), audio->dma + DMA_ARB_CONF);
+++}
+++
+++static int ws_i2s_start(struct ws_audio *audio, bool capture)
+++{
+++	void __iomem *conf = audio->i2s + (capture ? I2S_RX_CONF : I2S_TX_CONF);
+++	u32 value;
+++	int ret;
+++
+++	value = readl(conf) & ~I2S_CONF_START;
+++	writel(value | I2S_CONF_RESET | I2S_CONF_FIFO_RESET, conf);
+++	writel(value & ~(I2S_CONF_RESET | I2S_CONF_FIFO_RESET), conf);
+++	writel(value | I2S_CONF_UPDATE, conf);
+++	ret = readl_poll_timeout(conf, value, !(value & I2S_CONF_UPDATE), 1, 1000);
+++	if (ret)
+++		return ret;
+++	writel(readl(conf) | I2S_CONF_START, conf);
+++	return 0;
+++}
+++
+++static void ws_i2s_stop(struct ws_audio *audio, bool capture)
+++{
+++	void __iomem *conf = audio->i2s + (capture ? I2S_RX_CONF : I2S_TX_CONF);
+++
+++	writel(readl(conf) & ~I2S_CONF_START, conf);
+++}
+++
+++static void ws_dma_prepare(struct ws_audio *audio, bool capture, size_t len)
+++{
+++	phys_addr_t desc_phys = virt_to_phys(audio->desc);
+++	phys_addr_t buffer_phys = virt_to_phys(audio->buffer);
+++
+++	audio->desc->control = len | (len << 12) | BIT(30) | BIT(31);
+++	audio->desc->buffer = lower_32_bits(buffer_phys);
+++	audio->desc->next = 0;
+++
+++	/* Generic dma_sync does not cover descriptor/data visibility on this
+++	 * rv32imac NOMMU build: use the P4 ROM cache operations. */
+++	ws_cache_writeback(audio->buffer, len);
+++	ws_cache_writeback(audio->desc, sizeof(*audio->desc));
+++	if (capture)
+++		ws_cache_invalidate(audio->buffer, len);
+++
+++	if (capture) {
+++		writel(DMA_IN_LINK_STOP, audio->dma + DMA_IN_LINK_CH2);
+++		writel(DMA_CONF_RESET, audio->dma + DMA_IN_CONF0_CH2);
+++		writel(0, audio->dma + DMA_IN_CONF0_CH2);
+++		writel(DMA_OWNER_CHECK, audio->dma + DMA_IN_CONF1_CH2);
+++		writel(DMA_I2S1_TRIGGER, audio->dma + DMA_IN_PERI_SEL_CH2);
+++		writel(0xff, audio->dma + DMA_IN_INT_CLR_CH2);
+++		writel(lower_32_bits(desc_phys), audio->dma + DMA_IN_LINK_ADDR_CH2);
+++		writel(len, audio->i2s + I2S_RX_EOF_NUM);
+++		writel(DMA_IN_LINK_START, audio->dma + DMA_IN_LINK_CH2);
+++	} else {
+++		writel(DMA_OUT_LINK_STOP, audio->dma + DMA_OUT_LINK_CH2);
+++		writel(DMA_CONF_RESET, audio->dma + DMA_OUT_CONF0_CH2);
+++		writel(BIT(3), audio->dma + DMA_OUT_CONF0_CH2);
+++		writel(DMA_OWNER_CHECK, audio->dma + DMA_OUT_CONF1_CH2);
+++		writel(DMA_I2S1_TRIGGER, audio->dma + DMA_OUT_PERI_SEL_CH2);
+++		writel(0x7f, audio->dma + DMA_OUT_INT_CLR_CH2);
+++		writel(lower_32_bits(desc_phys), audio->dma + DMA_OUT_LINK_ADDR_CH2);
+++		writel(DMA_OUT_LINK_START, audio->dma + DMA_OUT_LINK_CH2);
+++	}
+++}
+++
+++static void ws_dma_stop(struct ws_audio *audio, bool capture)
+++{
+++	writel(capture ? DMA_IN_LINK_STOP : DMA_OUT_LINK_STOP,
+++	       audio->dma + (capture ? DMA_IN_LINK_CH2 : DMA_OUT_LINK_CH2));
+++}
+++
+++static int ws_audio_transfer(struct ws_audio *audio, bool capture, size_t len)
+++{
+++	void __iomem *status = audio->dma +
+++		(capture ? DMA_IN_INT_RAW_CH2 : DMA_OUT_INT_RAW_CH2);
+++	u32 done = capture ? DMA_IN_DONE : DMA_OUT_DONE;
+++	u32 error = capture ? DMA_IN_DESC_ERR : DMA_OUT_DESC_ERR;
+++	u32 value;
+++	int ret;
+++
+++	ws_enable_clocks(audio);
+++	ws_dma_prepare(audio, capture, len);
+++	ret = ws_i2s_start(audio, capture);
+++	if (ret)
+++		goto stop_dma;
+++
+++	/* 4080 bytes = 63.75 ms at 16 kHz stereo S16; 500 ms is "no clock". */
+++	ret = readl_poll_timeout(status, value, value & (done | error), 10, 500000);
+++	ws_i2s_stop(audio, capture);
+++	if (!ret && (value & error))
+++		ret = -EIO;
+++	if (!ret && capture)
+++		ws_cache_invalidate(audio->buffer, len);
+++
+++stop_dma:
+++	ws_dma_stop(audio, capture);
+++	if (ret == -ETIMEDOUT)
+++		dev_warn_ratelimited(audio->dev, "%s DMA timed out (no I2S clock?)\n",
+++				     capture ? "capture" : "playback");
+++	return ret;
+++}
+++
+++static void ws_ring_start(struct ws_audio *audio)
+++{
+++	phys_addr_t d0 = virt_to_phys(audio->rdesc);
+++	int i;
+++
+++	ws_enable_clocks(audio);
+++	for (i = 0; i < WS_RING_N; i++) {
+++		audio->rdesc[i].control = WS_AUDIO_MAX_IO | BIT(31); /* size, owner DMA */
+++		audio->rdesc[i].buffer = lower_32_bits(virt_to_phys(audio->ring +
+++							i * WS_RING_STRIDE));
+++		audio->rdesc[i].next = lower_32_bits(d0 + ((i + 1) % WS_RING_N) *
+++						     sizeof(struct ws_dma_desc));
+++	}
+++	ws_cache_writeback(audio->rdesc, WS_RING_N * sizeof(struct ws_dma_desc));
+++	ws_cache_writeback(audio->ring, WS_RING_N * WS_RING_STRIDE);
+++	ws_cache_invalidate(audio->ring, WS_RING_N * WS_RING_STRIDE);
+++
+++	writel(DMA_IN_LINK_STOP, audio->dma + DMA_IN_LINK_CH2);
+++	writel(DMA_CONF_RESET, audio->dma + DMA_IN_CONF0_CH2);
+++	writel(0, audio->dma + DMA_IN_CONF0_CH2);
+++	writel(0, audio->dma + DMA_IN_CONF1_CH2);	/* no owner check: circular */
+++	writel(DMA_I2S1_TRIGGER, audio->dma + DMA_IN_PERI_SEL_CH2);
+++	writel(0xff, audio->dma + DMA_IN_INT_CLR_CH2);
+++	writel(lower_32_bits(d0), audio->dma + DMA_IN_LINK_ADDR_CH2);
+++	writel(WS_AUDIO_MAX_IO, audio->i2s + I2S_RX_EOF_NUM);
+++	writel(DMA_IN_LINK_START, audio->dma + DMA_IN_LINK_CH2);
+++
+++	audio->cons = 0;
+++	audio->cons_off = 0;
+++	audio->first_block = true;
+++	audio->last_progress = jiffies;
+++	audio->running = !ws_i2s_start(audio, true);
+++	if (!audio->running) {
+++		writel(DMA_IN_LINK_STOP, audio->dma + DMA_IN_LINK_CH2);
+++		dev_warn(audio->dev, "capture: I2S RX did not start\n");
+++	}
+++}
+++
+++static void ws_ring_stop(struct ws_audio *audio)
+++{
+++	if (!audio->running)
+++		return;
+++	ws_i2s_stop(audio, true);
+++	writel(DMA_IN_LINK_STOP, audio->dma + DMA_IN_LINK_CH2);
+++	audio->running = false;
+++}
+++
+++/* Index of the newest completed ring slot, or -1 if none yet. */
+++static int ws_ring_newest(struct ws_audio *audio)
+++{
+++	u32 raw = readl(audio->dma + DMA_IN_INT_RAW_CH2);
+++	u32 addr, d0 = lower_32_bits(virt_to_phys(audio->rdesc));
+++
+++	if (!(raw & DMA_IN_SUC_EOF))
+++		return -1;
+++	addr = readl(audio->dma + DMA_IN_SUC_EOF_DES_ADDR_CH2);
+++	if (addr < d0 || addr >= d0 + WS_RING_N * sizeof(struct ws_dma_desc))
+++		return -1;
+++	return (addr - d0) / sizeof(struct ws_dma_desc);
+++}
+++
+++/* Wait until ring slot audio->cons is complete.  0, or -ETIMEDOUT. */
+++static int ws_ring_wait(struct ws_audio *audio)
+++{
+++	unsigned long deadline = jiffies + msecs_to_jiffies(500);
+++
+++	for (;;) {
+++		int newest = ws_ring_newest(audio);
+++
+++		if (newest >= 0) {
+++			unsigned int avail = (newest - audio->cons + 1 + WS_RING_N) % WS_RING_N;
+++
+++			/*
+++			 * More than a ring of time without consuming: the DMA
+++			 * has lapped the reader and avail is meaningless.
+++			 * Jump to the newest block.
+++			 */
+++			if (time_after(jiffies, audio->last_progress +
+++				       (WS_RING_N - 1) * WS_BLOCK_JIFFIES)) {
+++				audio->overruns++;
+++				audio->cons = newest;
+++				audio->cons_off = 0;
+++				audio->last_progress = jiffies;
+++				return 0;
+++			}
+++			if (avail)
+++				return 0;
+++		}
+++		if (time_after(jiffies, deadline))
+++			return -ETIMEDOUT;
+++		if (signal_pending(current))
+++			return -ERESTARTSYS;
+++		usleep_range(2000, 4000);
+++	}
+++}
+++
+++static ssize_t ws_ring_read(struct ws_audio *audio, char __user *buf, size_t count)
+++{
+++	size_t done = 0;
+++
+++	count &= ~3UL;
+++	while (done < count) {
+++		u8 *slot = audio->ring + audio->cons * WS_RING_STRIDE;
+++		size_t n;
+++		int ret;
+++
+++		if (audio->cons_off == 0) {
+++			ret = ws_ring_wait(audio);
+++			if (ret) {
+++				if (done)
+++					break;
+++				if (ret == -ETIMEDOUT)
+++					dev_warn_ratelimited(audio->dev,
+++						"capture DMA timed out (no I2S clock?)\n");
+++				return ret;
+++			}
+++			slot = audio->ring + audio->cons * WS_RING_STRIDE;
+++			ws_cache_invalidate(slot, WS_AUDIO_MAX_IO);
+++			if (audio->first_block) {
+++				/* stale FIFO word before the first real frame */
+++				memcpy(slot, slot + 4, 4);
+++				audio->first_block = false;
+++			}
+++		}
+++		n = min_t(size_t, count - done, WS_AUDIO_MAX_IO - audio->cons_off);
+++		if (copy_to_user(buf + done, slot + audio->cons_off, n))
+++			return done ? done : -EFAULT;
+++		done += n;
+++		audio->cons_off += n;
+++		if (audio->cons_off >= WS_AUDIO_MAX_IO) {
+++			audio->cons_off = 0;
+++			audio->cons = (audio->cons + 1) % WS_RING_N;
+++			audio->last_progress = jiffies;
+++		}
+++	}
+++	return done;
+++}
+++
+++static int ws_audio_open(struct inode *inode, struct file *file)
+++{
+++	struct miscdevice *miscdev = file->private_data;
+++	struct ws_audio *audio = container_of(miscdev, struct ws_audio, miscdev);
+++
+++	if (atomic_cmpxchg(&audio->busy, 0, 1))
+++		return -EBUSY;
+++	file->private_data = audio;
+++	return nonseekable_open(inode, file);
+++}
+++
+++static int ws_audio_release(struct inode *inode, struct file *file)
+++{
+++	struct ws_audio *audio = file->private_data;
+++
+++	mutex_lock(&audio->lock);
+++	ws_ring_stop(audio);
+++	mutex_unlock(&audio->lock);
+++	if (audio->overruns)
+++		dev_info(audio->dev, "capture: %lu overrun(s) (reader too slow)\n",
+++			 audio->overruns);
+++	atomic_set(&audio->busy, 0);
+++	return 0;
+++}
+++
+++static ssize_t ws_audio_read(struct file *file, char __user *buf,
+++			     size_t count, loff_t *ppos)
+++{
+++	struct ws_audio *audio = file->private_data;
+++	ssize_t ret;
+++
+++	if (count < 4)
+++		return -EINVAL;
+++	if (mutex_lock_interruptible(&audio->lock))
+++		return -ERESTARTSYS;
+++	if (!audio->running) {
+++		audio->overruns = 0;
+++		ws_ring_start(audio);
+++	}
+++	ret = audio->running ? ws_ring_read(audio, buf, count) : -EIO;
+++	mutex_unlock(&audio->lock);
+++	return ret;
+++}
+++
+++static ssize_t ws_audio_write(struct file *file, const char __user *buf,
+++			      size_t count, loff_t *ppos)
+++{
+++	struct ws_audio *audio = file->private_data;
+++	size_t len = min_t(size_t, count, WS_AUDIO_MAX_IO) & ~3UL;
+++	int ret;
+++
+++	if (!len)
+++		return -EINVAL;
+++	if (mutex_lock_interruptible(&audio->lock))
+++		return -ERESTARTSYS;
+++	if (copy_from_user(audio->buffer, buf, len)) {
+++		mutex_unlock(&audio->lock);
+++		return -EFAULT;
+++	}
+++	ret = ws_audio_transfer(audio, false, len);
+++	mutex_unlock(&audio->lock);
+++	return ret ? ret : len;
+++}
+++
+++static const struct file_operations ws_audio_fops = {
+++	.owner = THIS_MODULE,
+++	.open = ws_audio_open,
+++	.release = ws_audio_release,
+++	.read = ws_audio_read,
+++	.write = ws_audio_write,
+++};
+++
+++static int ws_audio_probe(struct platform_device *pdev)
+++{
+++	struct device *dev = &pdev->dev;
+++	struct ws_audio *audio;
+++	phys_addr_t desc_phys, buffer_phys;
+++	int ret;
+++
+++	audio = devm_kzalloc(dev, sizeof(*audio), GFP_KERNEL);
+++	if (!audio)
+++		return -ENOMEM;
+++	audio->dev = dev;
+++	audio->i2s = devm_platform_ioremap_resource_byname(pdev, "i2s");
+++	if (IS_ERR(audio->i2s))
+++		return PTR_ERR(audio->i2s);
+++	audio->dma = devm_platform_ioremap_resource_byname(pdev, "ahb-dma");
+++	if (IS_ERR(audio->dma))
+++		return PTR_ERR(audio->dma);
+++	audio->clkrst = devm_platform_ioremap_resource_byname(pdev, "clkrst");
+++	if (IS_ERR(audio->clkrst))
+++		return PTR_ERR(audio->clkrst);
+++
+++	audio->buffer = devm_kmalloc(dev, WS_AUDIO_MAX_IO, GFP_KERNEL);
+++	audio->desc = devm_kzalloc(dev, sizeof(*audio->desc), GFP_KERNEL);
+++	audio->ring = devm_kmalloc(dev, WS_RING_N * WS_RING_STRIDE, GFP_KERNEL);
+++	audio->rdesc = devm_kcalloc(dev, WS_RING_N, sizeof(*audio->rdesc), GFP_KERNEL);
+++	if (!audio->buffer || !audio->desc || !audio->ring || !audio->rdesc)
+++		return -ENOMEM;
+++	if (virt_to_phys(audio->ring) < 0x40000000 ||
+++	    virt_to_phys(audio->ring) + WS_RING_N * WS_RING_STRIDE > 0x4ffc0000 ||
+++	    virt_to_phys(audio->rdesc) < 0x40000000 ||
+++	    virt_to_phys(audio->rdesc) >= 0x4ffc0000) {
+++		dev_err(dev, "capture ring outside the ESP32-P4 DMA range\n");
+++		return -ERANGE;
+++	}
+++	atomic_set(&audio->busy, 0);
+++	desc_phys = virt_to_phys(audio->desc);
+++	buffer_phys = virt_to_phys(audio->buffer);
+++	if (upper_32_bits(desc_phys) || upper_32_bits(buffer_phys) ||
+++	    desc_phys < 0x40000000 || desc_phys >= 0x4ffc0000 ||
+++	    buffer_phys < 0x40000000 ||
+++	    buffer_phys + WS_AUDIO_MAX_IO > 0x4ffc0000) {
+++		dev_err(dev, "DMA memory outside the ESP32-P4 addressable range\n");
+++		return -ERANGE;
+++	}
+++
+++	mutex_init(&audio->lock);
+++	audio->miscdev.minor = MISC_DYNAMIC_MINOR;
+++	audio->miscdev.name = "ws-audio";
+++	audio->miscdev.fops = &ws_audio_fops;
+++	audio->miscdev.parent = dev;
+++	/* Single-user board: let m5 record without root. */
+++	audio->miscdev.mode = 0666;
+++	ret = misc_register(&audio->miscdev);
+++	if (ret)
+++		return ret;
+++	platform_set_drvdata(pdev, audio);
+++	ws_enable_clocks(audio);
+++	dev_info(dev, "/dev/ws-audio: %d Hz, %d-bit, %d-channel PCM (mic = left), continuous capture, %d x %d-byte ring\n",
+++		 WS_AUDIO_RATE, WS_AUDIO_BITS, WS_AUDIO_CHANNELS, WS_RING_N, WS_AUDIO_MAX_IO);
+++	return 0;
+++}
+++
+++static void ws_audio_remove(struct platform_device *pdev)
+++{
+++	struct ws_audio *audio = platform_get_drvdata(pdev);
+++
+++	misc_deregister(&audio->miscdev);
+++}
+++
+++static const struct of_device_id ws_audio_of_match[] = {
+++	{ .compatible = "waveshare,esp32p4-wifi6-audio" },
+++	{}
+++};
+++MODULE_DEVICE_TABLE(of, ws_audio_of_match);
+++
+++static struct platform_driver ws_audio_driver = {
+++	.probe = ws_audio_probe,
+++	.remove = ws_audio_remove,
+++	.driver = {
+++		.name = "esp32p4-ws-audio",
+++		.of_match_table = ws_audio_of_match,
+++	},
+++};
+++module_platform_driver(ws_audio_driver);
+++
+++MODULE_DESCRIPTION("Waveshare ESP32-P4-WIFI6 lightweight PCM audio (ES8311)");
+++MODULE_LICENSE("GPL");
