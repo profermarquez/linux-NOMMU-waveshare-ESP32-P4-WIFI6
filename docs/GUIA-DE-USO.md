@@ -936,6 +936,7 @@ Probado en la placa el 2026-11-23.
 | `api-sqlite` | API REST sobre una tabla SQLite, puerto 8001 | C + Mongoose + SQLite | 770 KB |
 | `api_microdot.py` | API REST de notas, puerto 8002 | MicroPython + Microdot | — |
 | `tflm-seno` | TensorFlow Lite Micro: modelo de ejemplo y `.tflite` propios | C++ | 310 KB |
+| `tflm-mnist` | reconoce dígitos escritos a mano (0–9) en una imagen | C++ | 338 KB |
 
 Las bibliotecas de terceros no están en el repositorio: `descargar.sh` las
 baja y verifica su SHA-256.
@@ -1151,6 +1152,53 @@ El modelo float tarda ~155 µs por inferencia, con error máximo 0,039.
   - el modelo y su arena tienen que entrar en la RAM libre (~2–5 MB);
   - no hay entrenamiento en la placa;
   - no hay TensorFlow "completo" ni PyTorch.
+
+#### Reconocer dígitos escritos a mano (`tflm-mnist`)
+
+`tflm-mnist` usa el modelo LSTM del ejemplo `mnist_lstm` de TFLM:
+- carga la imagen con stb_image (PNG, JPEG, BMP, GIF, PGM…);
+- la pasa a gris y a 28×28;
+- dibuja en la terminal lo que ve el modelo;
+- dice qué dígito es, con la probabilidad de cada uno.
+
+```bash
+make -C examples/tflm deploy PLACA=stamp-p4.local    # desde la Mac; copia también los dígitos de ejemplo
+```
+
+```sh
+cd /home/m5/imagenes
+tflm-mnist sample3.png            # dibujo + dígito + probabilidades
+tflm-mnist -q sample?.png         # solo "archivo: dígito"
+tflm-mnist -f sample9.png         # modelo float en vez de int8
+tflm-mnist -i foto.jpg            # forzar invertir (tinta oscura sobre papel)
+```
+
+Salida real:
+
+```
+digito: 3   (89.5 %, 5.9 ms)
+0:  0.0%  1:  0.0%  2:  1.2%  3: 89.5%  4:  0.8%
+5:  3.9%  6:  0.0%  7:  0.0%  8:  0.0%  9:  4.7%
+```
+
+Probado en la placa el 2026-11-24:
+
+| Prueba | Resultado |
+|---|---|
+| los 10 dígitos de ejemplo (`sample0`–`sample9`), int8 y float | 10 de 10 bien, en cualquier orden |
+| `resized9.png` (10×10, agrandada a 28×28) | 9 |
+| JPEG de 28×28 y de 640×480 | 7 (correcto) |
+| dígito negro sobre blanco de 280×280 | se invierte solo y da 4 (99,6 %); con `-I` (sin invertir) da 6 |
+| tiempo por imagen | int8 6–17 ms, float ~88 ms; los 10 dígitos en 0,09 s en total |
+
+- **El modelo espera un dígito blanco sobre fondo negro, centrado**, como
+  MNIST.  Si la imagen es mayormente clara la invierte sola (`-i` fuerza
+  invertir, `-I` lo impide).
+- Para una foto de papel: recortá el dígito y que ocupe casi todo el
+  cuadro.  El programa no busca el dígito dentro de la imagen.
+- El LSTM guarda estado entre una inferencia y otra.  `tflm-mnist` lo
+  reinicia antes de cada imagen; sin eso, en la primera prueba `sample9` dio
+  3 al procesarse después de `sample8`.
 
 #### Ver imágenes en la terminal (`ver-imagen`)
 

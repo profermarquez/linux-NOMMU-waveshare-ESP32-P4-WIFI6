@@ -1,9 +1,10 @@
 # TensorFlow Lite for Microcontrollers for the Waveshare ESP32-P4 v2 board.
 #
 # From the Mac (the compiler lives in the build VM; make re-runs itself there):
-#   sh ../terceros/descargar.sh tflite-micro    once: clone + export the tree
-#   make                 build libtflm.a and tflm-seno
-#   make deploy          copy tflm-seno and the .tflite models to the board
+#   sh ../terceros/descargar.sh tflite-micro stb   once: sources
+#   make                 build libtflm.a, tflm-seno and tflm-mnist
+#   make deploy          copy both programs, the .tflite models and the
+#                        MNIST sample digits to the board
 #   make clean
 # Variables: PLACA=stamp-p4.local USUARIO=m5 DESTINO=/home/m5/bin VM=rv32dev
 #
@@ -37,6 +38,8 @@ FLTHDR := $(CROSS)flthdr
 
 TREE ?= ../terceros/tflm-tree
 MODELS ?= ../terceros/tflite-micro/tensorflow/lite/micro/examples/hello_world/models
+MNIST ?= ../terceros/tflite-micro/tensorflow/lite/micro/examples/mnist_lstm
+STB ?= ../terceros/stb
 B := build
 
 # Same flags TFLM uses for microcontrollers (no exceptions/RTTI, static
@@ -57,7 +60,7 @@ LIB_CC := $(shell test -d $(TREE) && find $(TREE)/tensorflow -name '*.cc' \
 LIB_C := $(shell test -d $(TREE) && find $(TREE)/tensorflow -name '*.c')
 LIB_OBJ := $(patsubst $(TREE)/%,$(B)/lib/%.o,$(LIB_CC) $(LIB_C))
 
-all: tflm-seno
+all: tflm-seno tflm-mnist
 
 $(B)/lib/%.cc.o: $(TREE)/%.cc
 	@mkdir -p $(dir $@)
@@ -87,13 +90,30 @@ tflm-seno: tflm-seno.cc $(B)/modelos.h $(B)/libtflm.a
 	rm -f $@.gdb
 	@echo "$@: $$(od -An -tu4 --endian=big -j 20 -N 8 $@ | awk '{print int(($$1 + $$2) / 1024)}') KB of RAM at exec"
 
+# The mnist_lstm models (LSTM, 28x28 digit -> 10 classes) as C arrays.
+$(B)/modelos-mnist.h: $(MNIST)/trained_lstm_int8.tflite $(MNIST)/trained_lstm.tflite
+	@mkdir -p $(B)
+	{ echo "// generated from TFLM mnist_lstm models (Apache-2.0)"; \
+	  echo "alignas(16) const unsigned char g_mnist_int8[] = {"; \
+	  xxd -i < $(MNIST)/trained_lstm_int8.tflite; echo "};"; \
+	  echo "alignas(16) const unsigned char g_mnist_float[] = {"; \
+	  xxd -i < $(MNIST)/trained_lstm.tflite; echo "};"; } > $@
+
+tflm-mnist: tflm-mnist.cc $(B)/modelos-mnist.h $(B)/libtflm.a
+	@test -f $(STB)/stb_image.h || { echo "missing stb_image.h: run sh ../terceros/descargar.sh stb" >&2; exit 1; }
+	$(CXX) $(CXXFLAGS) -Wall -I$(STB) -o $@ $< $(B)/libtflm.a $(LDFLAGS) -lm
+	$(FLTHDR) -s 65536 $@
+	rm -f $@.gdb
+	@echo "$@: $$(od -An -tu4 --endian=big -j 20 -N 8 $@ | awk '{print int(($$1 + $$2) / 1024)}') KB of RAM at exec"
+
 clean:
-	rm -rf $(B) tflm-seno tflm-seno.gdb
+	rm -rf $(B) tflm-seno tflm-seno.gdb tflm-mnist tflm-mnist.gdb
 
 endif
 
 deploy: all
-	ssh $(SSH_OPTS) $(USUARIO)@$(PLACA) 'mkdir -p $(DESTINO) /home/$(USUARIO)/modelos'
-	scp -O $(SSH_OPTS) tflm-seno $(USUARIO)@$(PLACA):$(DESTINO)/
+	ssh $(SSH_OPTS) $(USUARIO)@$(PLACA) 'mkdir -p $(DESTINO) /home/$(USUARIO)/modelos /home/$(USUARIO)/imagenes'
+	scp -O $(SSH_OPTS) tflm-seno tflm-mnist $(USUARIO)@$(PLACA):$(DESTINO)/
 	scp -O $(SSH_OPTS) ../terceros/tflite-micro/tensorflow/lite/micro/examples/hello_world/models/*.tflite $(USUARIO)@$(PLACA):/home/$(USUARIO)/modelos/
-	@echo "copied tflm-seno to $(DESTINO) and the models to /home/$(USUARIO)/modelos"
+	scp -O $(SSH_OPTS) ../terceros/tflite-micro/tensorflow/lite/micro/examples/mnist_lstm/samples/*.png $(USUARIO)@$(PLACA):/home/$(USUARIO)/imagenes/
+	@echo "copied tflm-seno and tflm-mnist to $(DESTINO), the models to /home/$(USUARIO)/modelos, the digits to /home/$(USUARIO)/imagenes"

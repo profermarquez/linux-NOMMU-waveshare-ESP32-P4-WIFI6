@@ -1,3 +1,4 @@
 build/
 tflm-seno
+tflm-mnist
 *.gdb
