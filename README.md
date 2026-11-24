@@ -79,7 +79,7 @@ a paso, backup y recuperación: **[docs/INSTALAR.md](docs/INSTALAR.md)**.
 | `docs/VOLVER-A-V1.md` | Cómo volver a la v1 (y de nuevo a la v2) |
 | `CHANGELOG.md` | Qué cambió en la v2, qué está limitado y qué falló |
 | `source/0001-waveshare-esp32-p4-wifi6-v2.patch` | Los cambios respecto del proyecto base (aplicar sobre el commit `69a7312`) |
-| `examples/` | Ejemplos: shell, MicroPython (cliente y servidor HTTP, mini navegador de texto `navegador.py`), C (`c-hello`, `c-sysinfo`, `c-gpio`), C++ (`cpp/`), SQLite y visor web de tablas (`sqlite/`), servidor web y API REST en C con Mongoose (`c-api/`), TensorFlow Lite Micro (`tflm/`), `wifi-ejemplo.txt`.  Guía 11.11 |
+| `examples/` | Ejemplos: shell, MicroPython (cliente y servidor HTTP, mini navegador de texto `navegador.py`), C (`c-hello`, `c-sysinfo`, `c-gpio`), C++ (`cpp/`), SQLite y visor web de tablas (`sqlite/`), servidor web y API REST en C con Mongoose (`c-api/`), TensorFlow Lite Micro (`tflm/`), visor de imágenes en la terminal (`ver-imagen/`), `wifi-ejemplo.txt`.  Guía 11.11 |
 | `LICENSE` | GPL-2.0, la licencia del proyecto base |
 
 ## Imágenes

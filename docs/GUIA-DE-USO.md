@@ -945,6 +945,7 @@ baja y verifica su SHA-256.
 | SQLite | 3.54.1 | dominio público |
 | Microdot | 2.8.0 | MIT |
 | Mongoose | 7.24 | **GPLv2** (o licencia comercial de Cesanta si el programa se distribuye cerrado) |
+| stb_image | 2.34 (commit `6b5799b`) | dominio público o MIT |
 | TensorFlow Lite Micro | commit `38a8f0f` | Apache-2.0 |
 
 #### Instalar (desde la Mac, en la carpeta del repositorio)
@@ -1150,6 +1151,52 @@ El modelo float tarda ~155 µs por inferencia, con error máximo 0,039.
   - el modelo y su arena tienen que entrar en la RAM libre (~2–5 MB);
   - no hay entrenamiento en la placa;
   - no hay TensorFlow "completo" ni PyTorch.
+
+#### Ver imágenes en la terminal (`ver-imagen`)
+
+`ver-imagen` abre una imagen guardada en la microSD y la dibuja con
+caracteres en la terminal SSH.  Lee PNG, JPEG, BMP, GIF (el primer cuadro),
+TGA y PGM/PPM, con stb_image.
+
+```bash
+make -C examples/ver-imagen deploy PLACA=stamp-p4.local       # desde la Mac
+scp -O foto.jpg m5@stamp-p4.local:/home/m5/imagenes/           # subir imágenes
+```
+
+```sh
+ver-imagen /home/m5/imagenes/sample7.png            # colores (256), por defecto
+ver-imagen -m ascii /home/m5/imagenes/sample7.png   # solo caracteres " .:-=+*#%@"
+ver-imagen -m bloques -w 40 foto.jpg                # ░▒▓█, 40 columnas
+ver-imagen -m color foto.jpg                        # 24 bits (iTerm y otras)
+ver-imagen -n /home/m5/imagenes/*.png               # solo tamaño y canales
+```
+
+| Modo | Cómo se ve | Terminal |
+|---|---|---|
+| `ascii` | `" .:-=+*#%@"` según el brillo | cualquiera |
+| `bloques` | `░▒▓█` | UTF-8 |
+| `gris` | medio bloque `▀` con 24 grises (2 píxeles por carácter) | 256 colores |
+| `256` (por defecto) | medio bloque con la paleta de 256 colores | Terminal de la Mac, iTerm |
+| `color` | medio bloque en color de 24 bits | iTerm y la mayoría de las modernas |
+
+- `-w` fija el ancho en columnas.  Por defecto entra en 80 (o
+  `$COLUMNS`), y las imágenes chicas, como los dígitos MNIST de 28×28, se
+  agrandan.
+- `-i` invierte el brillo en `ascii` y `bloques`.
+- **Límite:** la imagen se decodifica entera en RAM.  Más de 700 000
+  píxeles (por ejemplo 1600×1200) se rechaza con un aviso; achicala antes
+  en la computadora, a 640×480 por ejemplo.
+- `make deploy` también copia a `/home/m5/imagenes` los dígitos de ejemplo
+  de `mnist_lstm` (si bajaste tflite-micro).
+
+Probado en la Mac (mismo código, compilado para macOS):
+- PNG y JPEG de 28×28;
+- JPEG de 640×480 reducido a 80×30;
+- rechazo de 1600×1200;
+- error claro con un archivo que no es imagen.
+
+En la placa compila (205 KB de RAM al arrancar) pero **todavía no lo probé**:
+la placa no respondía en la red.
 
 #### Dejar un servidor corriendo
 

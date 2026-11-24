@@ -4,7 +4,7 @@
 #
 #   sh examples/terceros/descargar.sh            # everything
 #   sh examples/terceros/descargar.sh sqlite     # only one: sqlite, microdot,
-#                                                # mongoose, tflite-micro
+#                                                # mongoose, stb, tflite-micro
 #
 # Leaves them in examples/terceros/<name>/.  Versions and hashes are the
 # ones tested on the board (2026-11-23).
@@ -16,6 +16,7 @@ SQLITE_ZIP=sqlite-amalgamation-$SQLITE_VER.zip
 SQLITE_SHA=0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9
 MICRODOT_VER=v2.8.0
 MONGOOSE_VER=7.24
+STB_COMMIT=6b5799bae8a1fe3792691ef4b72ae26434c3e799   # stb_image v2.34
 # tflite-micro has no releases: a fixed commit of the main branch.
 TFLM_COMMIT=${TFLM_COMMIT:-38a8f0f87302817ddfa99e6a995c7b71ef7118fe}
 
@@ -65,6 +66,13 @@ mongoose() {
     cd ..
 }
 
+stb() {
+    mkdir -p stb && cd stb
+    [ -f stb_image.h ] || curl -sSfLO "https://raw.githubusercontent.com/nothings/stb/$STB_COMMIT/stb_image.h"
+    check stb_image.h dfc2aadda6295f67f677587773f25e5bf8c8ad427ed0db7c518525c91e72e020
+    cd ..
+}
+
 tflite_micro() {
     if [ ! -d tflite-micro/.git ]; then
         git clone -q --depth 1 https://github.com/tensorflow/tflite-micro.git
@@ -82,12 +90,13 @@ tflite_micro() {
     echo "ok  tflm-tree"
 }
 
-if [ $# -eq 0 ]; then set -- sqlite microdot mongoose tflite-micro; fi
+if [ $# -eq 0 ]; then set -- sqlite microdot mongoose stb tflite-micro; fi
 for p in "$@"; do
     case $p in
         sqlite) sqlite ;;
         microdot) microdot ;;
         mongoose) mongoose ;;
+        stb) stb ;;
         tflite-micro) tflite_micro ;;
         *) echo "unknown: $p" >&2; exit 2 ;;
     esac
