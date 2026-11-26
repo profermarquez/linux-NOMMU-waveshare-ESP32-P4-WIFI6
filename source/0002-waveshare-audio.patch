@@ -1,10 +1,10 @@
-Microfono del ES8311 (Waveshare ESP32-P4-WIFI6) sobre la v2.
+Microfono y parlante del ES8311 (Waveshare ESP32-P4-WIFI6) sobre la v2.
 
 Aplicar sobre el arbol de la v2 (0001-waveshare-esp32-p4-wifi6-v2.patch sobre 69a7312).
 Falta la biblioteca esp_codec_dev 1.4.0 (Apache-2.0, del registro de componentes de
 Espressif, https://components.espressif.com/components/espressif/esp_codec_dev), que va
 copiada en linux/boot-shim/components/esp_codec_dev/ (sin test_apps).
-Commits: 72295d0 0e9f661 7dc4b71 f2f4788 71db1f8 
+Commits: 0d328e2 a7e4c39 88dd6aa 72295d0 0e9f661 7dc4b71 f2f4788 71db1f8 
 
 diff --git a/linux/boot-shim/main/CMakeLists.txt b/linux/boot-shim/main/CMakeLists.txt
 index ad265dc..14fae66 100644
@@ -50,10 +50,10 @@ index cc7b49c..ca15535 100644
  	/* Stamp carrier USB-A gadget on GPIO26/27; on Waveshare those pins
 diff --git a/linux/boot-shim/main/ws_audio.c b/linux/boot-shim/main/ws_audio.c
 new file mode 100644
-index 0000000..779bda9
+index 0000000..6f34f69
 --- /dev/null
 +++ b/linux/boot-shim/main/ws_audio.c
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,553 @@
 +// SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-only
 +/*
 + * Waveshare ESP32-P4-WIFI6: prepare the ES8311 codec and I2S1 for Linux and
@@ -62,8 +62,10 @@ index 0000000..779bda9
 + * Wiring (Waveshare BSP waveshare/esp32_p4_platform 2.0.1, header
 + * esp32_p4_platform.h, and its 12_I2SCodec example):
 + *   I2C (codec control): SDA GPIO7, SCL GPIO8, ES8311 at 0x18
-+ *   I2S: MCLK 13, BCLK 12, LRCK 10, DOUT 9 (to DSDIN, unused for now), DIN 11
-+ *   Power amplifier enable: GPIO53, active high (kept OFF here)
++ *   I2S: MCLK 13, BCLK 12, LRCK 10, DOUT 9 (to DSDIN), DIN 11 (from ASDOUT)
++ *   Power amplifier enable: GPIO53, active high (OFF here; Linux turns it on
++ *   while it plays)
++ *   Speaker: SPK header (MX1.25 2P, 8 ohm 2 W) on the amplifier output
 + *   Microphone: analog, into the ES8311 ADC (digital_mic = false)
 + *
 + * ESP-IDF owns the clock and GPIO-matrix setup.  Linux inherits the
@@ -73,12 +75,14 @@ index 0000000..779bda9
 + * jump so no ESP-IDF DMA or interrupt stays active, and GPIO7/8 are handed
 + * back as plain GPIO so Linux's i2c-gpio bus keeps working.
 + *
-+ * Before releasing everything this records MIC_TEST_MS of audio and logs
++ * With -DWS_SPEAKER_TEST it first checks the speaker (speaker_beep(): tone
++ * heard back by the microphone, codec registers, three beeps; off by default).  Then it records MIC_TEST_MS of audio and logs
 + * the level of each channel, so the serial console shows whether the
 + * microphone works without any Linux driver:
 + *   ws_audio: mic L rms=... peak=... dc=...  R rms=... peak=...
 + */
 +#include <stdint.h>
++#include <stdbool.h>
 +#include <stdlib.h>
 +#include <math.h>
 +#include <inttypes.h>
@@ -91,6 +95,8 @@ index 0000000..779bda9
 +#include "esp_log.h"
 +#include "esp_rom_gpio.h"
 +#include "soc/gpio_sig_map.h"
++#include "soc/gpio_reg.h"
++#include "soc/soc.h"
 +
 +#include "ws_audio.h"
 +
@@ -109,12 +115,14 @@ index 0000000..779bda9
 +#define WS_CHANNELS	2
 +#define WS_BITS		16
 +#define WS_MIC_GAIN_DB	24.0f	/* Waveshare BSP default */
++#define WS_OUT_VOLUME	90	/* esp_codec_dev 0..100; 70 gave ES8311 0x32 = 0xa8 (-11.5 dB) */
 +#define MIC_TEST_MS	500
 +#define MIC_SKIP_MS	100	/* ADC start-up transient */
 +#define MIC_CHUNK	3200	/* 50 ms of stereo S16 */
 +
 +static const char *TAG = "ws_audio";
 +static i2s_chan_handle_t rx_chan;
++static i2s_chan_handle_t tx_chan;
 +static i2c_master_bus_handle_t i2c_bus;
 +static esp_codec_dev_handle_t codec;
 +
@@ -156,24 +164,29 @@ index 0000000..779bda9
 +			.mclk = WS_I2S_MCLK,
 +			.bclk = WS_I2S_BCLK,
 +			.ws = WS_I2S_WS,
-+			.dout = I2S_GPIO_UNUSED,	/* capture only for now */
++			.dout = WS_I2S_DOUT,
 +			.din = WS_I2S_DIN,
 +		},
 +	};
 +	esp_err_t err;
 +
++	chan_cfg.auto_clear = true;
 +	std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
 +
 +	/*
-+	 * RX only (simplex), as master: RX then generates BCLK/LRCK and MCLK
-+	 * itself.  A full-duplex pair makes RX a slave of TX (rx_slave_mod,
-+	 * tx_conf.sig_loopback), and under Linux, with no TX data, TX stays
-+	 * idle and RX never gets a clock: every /dev/ws-audio read timed out
-+	 * on the board (even with TX started and tx_stop_en = 0).
++	 * Full duplex, as ESP-IDF sets it up: TX is the master and RX a slave
++	 * sharing BCLK/LRCK (rx_slave_mod, tx_conf.sig_loopback).  Under Linux
++	 * RX therefore only gets a clock while TX runs, so the Linux driver
++	 * keeps a TX DMA ring running (silence when nothing plays) for as long
++	 * as /dev/ws-audio is open in either direction.
 +	 */
-+	err = i2s_new_channel(&chan_cfg, NULL, &rx_chan);
++	err = i2s_new_channel(&chan_cfg, &tx_chan, &rx_chan);
++	if (err == ESP_OK)
++		err = i2s_channel_init_std_mode(tx_chan, &std_cfg);
 +	if (err == ESP_OK)
 +		err = i2s_channel_init_std_mode(rx_chan, &std_cfg);
++	if (err == ESP_OK)
++		err = i2s_channel_enable(tx_chan);
 +	if (err == ESP_OK)
 +		err = i2s_channel_enable(rx_chan);
 +	return err;
@@ -199,7 +212,7 @@ index 0000000..779bda9
 +	audio_codec_i2s_cfg_t data_cfg = {
 +		.port = WS_I2S_PORT,
 +		.rx_handle = rx_chan,
-+		.tx_handle = NULL,
++		.tx_handle = tx_chan,
 +	};
 +	const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&data_cfg);
 +	audio_codec_i2c_cfg_t i2c_cfg = {
@@ -211,7 +224,7 @@ index 0000000..779bda9
 +	es8311_codec_cfg_t es_cfg = {
 +		.ctrl_if = ctrl_if,
 +		.gpio_if = gpio_if,
-+		.codec_mode = ESP_CODEC_DEV_WORK_MODE_ADC,
++		.codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,
 +		.pa_pin = -1,		/* amplifier stays off (pa_off) */
 +		.master_mode = false,
 +		.use_mclk = true,
@@ -237,7 +250,7 @@ index 0000000..779bda9
 +	if (!codec_if)
 +		return ESP_ERR_NOT_FOUND;	/* usually: no ACK at 0x18 */
 +	dev_cfg = (esp_codec_dev_cfg_t) {
-+		.dev_type = ESP_CODEC_DEV_TYPE_IN,
++		.dev_type = ESP_CODEC_DEV_TYPE_IN_OUT,
 +		.codec_if = codec_if,
 +		.data_if = data_if,
 +	};
@@ -247,6 +260,8 @@ index 0000000..779bda9
 +	if (esp_codec_dev_open(codec, &sample) != ESP_CODEC_DEV_OK)
 +		return ESP_FAIL;
 +	esp_codec_dev_set_in_gain(codec, WS_MIC_GAIN_DB);
++	/* DAC level for Linux playback: the player scales in software. */
++	esp_codec_dev_set_out_vol(codec, WS_OUT_VOLUME);
 +	return ESP_OK;
 +}
 +
@@ -332,14 +347,244 @@ index 0000000..779bda9
 +	}
 +}
 +
++#ifdef WS_SPEAKER_TEST
++/*
++ * Speaker check (diagnostic), before the microphone setup for Linux:
++ *  1. full duplex at 16 kHz: 0.5 s of silence, then a 1 kHz tone for 1.5 s,
++ *     recording the on-board microphone all the time; logs the microphone
++ *     RMS in silence and during the tone (acoustic loopback: if the speaker
++ *     plays, the tone RMS is clearly higher);
++ *  2. logs ES8311 power/mute/volume registers and the GPIO53 (amplifier
++ *     enable) output level while the tone plays;
++ *  3. three 1 s beeps (660 Hz) with pauses, for a person to hear.
++ * Everything it creates is deleted again, so the RX-only setup for Linux
++ * below is unchanged.  Never fatal.  -DWS_NO_BEEP leaves it out.
++ */
++#define BEEP_VOLUME	70	/* esp_codec_dev 0..100 */
++#define BEEP_AMPLITUDE	8000	/* of 32767, about -12 dBFS */
++#define BEEP_FADE	160	/* 10 ms fade in/out against clicks */
++#define BEEP_CHUNK	320	/* 20 ms */
++
++/* Write one 20 ms chunk of tone (freq 0 = silence) starting at frame k0 of a
++ * tone that is `frames` long; if dev reads too, read 20 ms of microphone
++ * and return its sum of squares (left channel) in *sq. */
++static void dup_chunk(esp_codec_dev_handle_t dev, int16_t *out, int16_t *in,
++		      int freq, int k0, int frames, double *sq)
++{
++	for (int i = 0; i < BEEP_CHUNK; i++) {
++		int k = k0 + i;
++		float g = 1.0f;
++		int16_t v = 0;
++
++		if (freq) {
++			if (k < BEEP_FADE)
++				g = (float)k / BEEP_FADE;
++			else if (frames - k < BEEP_FADE)
++				g = (float)(frames - k) / BEEP_FADE;
++			v = (int16_t)(BEEP_AMPLITUDE * g *
++				      sinf(2.0f * (float)M_PI * freq * k / WS_RATE));
++		}
++		out[2 * i] = v;
++		out[2 * i + 1] = v;
++	}
++	esp_codec_dev_write(dev, out, BEEP_CHUNK * 4);
++	if (in && sq && esp_codec_dev_read(dev, in, BEEP_CHUNK * 4) == ESP_CODEC_DEV_OK) {
++		for (int i = 0; i < BEEP_CHUNK; i++)
++			*sq += (double)in[2 * i] * in[2 * i];
++	}
++}
++
++static void play_and_listen(esp_codec_dev_handle_t dev, int16_t *out, int16_t *in,
++			    int freq, int ms, int skip_ms, double *rms)
++{
++	const int frames = WS_RATE * ms / 1000;
++	double sq = 0;
++	int counted = 0;
++
++	for (int k = 0; k < frames; k += BEEP_CHUNK) {
++		double c = 0;
++
++		dup_chunk(dev, out, in, freq, k, frames, in ? &c : NULL);
++		if (k >= WS_RATE * skip_ms / 1000) {
++			sq += c;
++			counted += BEEP_CHUNK;
++		}
++	}
++	if (rms)
++		*rms = counted ? sqrt(sq / counted) : 0;
++}
++
++static void dump_codec(esp_codec_dev_handle_t dev, const char *when)
++{
++	static const int regs[] = { 0x00, 0x01, 0x0d, 0x0e, 0x12, 0x13, 0x14, 0x31, 0x32, 0x37 };
++	char line[160];
++	int len = 0;
++
++	for (unsigned int i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		int v = -1;
++
++		esp_codec_dev_read_reg(dev, regs[i], &v);
++		len += snprintf(line + len, sizeof(line) - len, " %02x=%02x", regs[i], v & 0xff);
++	}
++	ESP_LOGI(TAG, "speaker test %s: ES8311%s; GPIO53 out=%d", when, line,
++		 (int)((REG_READ(GPIO_OUT1_REG) >> (WS_PA_ENABLE - 32)) & 1));
++}
++
++static void speaker_beep(void)
++{
++	i2s_chan_handle_t tx = NULL, rx = NULL;
++	i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(WS_I2S_PORT, I2S_ROLE_MASTER);
++	i2s_std_config_t std_cfg = {
++		.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(WS_RATE),
++		.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
++								I2S_SLOT_MODE_STEREO),
++		.gpio_cfg = {
++			.mclk = WS_I2S_MCLK,
++			.bclk = WS_I2S_BCLK,
++			.ws = WS_I2S_WS,
++			.dout = WS_I2S_DOUT,
++			.din = WS_I2S_DIN,
++		},
++	};
++	const audio_codec_gpio_if_t *gpio_if = NULL;
++	const audio_codec_data_if_t *data_if = NULL;
++	const audio_codec_ctrl_if_t *ctrl_if = NULL;
++	const audio_codec_if_t *codec_if = NULL;
++	esp_codec_dev_handle_t dev = NULL;
++	int16_t *out = NULL, *in = NULL;
++	double rms_sil = 0, rms_tone = 0;
++	bool enabled = false;	/* I2S channels still enabled (must be off before Linux) */
++
++	std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
++	chan_cfg.auto_clear = true;
++	if (i2s_new_channel(&chan_cfg, &tx, &rx) != ESP_OK ||
++	    i2s_channel_init_std_mode(tx, &std_cfg) != ESP_OK ||
++	    i2s_channel_init_std_mode(rx, &std_cfg) != ESP_OK ||
++	    i2s_channel_enable(tx) != ESP_OK || i2s_channel_enable(rx) != ESP_OK) {
++		ESP_LOGW(TAG, "speaker test: I2S setup failed");
++		goto out;
++	}
++	enabled = true;
++
++	audio_codec_i2s_cfg_t data_cfg = {
++		.port = WS_I2S_PORT,
++		.rx_handle = rx,
++		.tx_handle = tx,
++	};
++	audio_codec_i2c_cfg_t i2c_cfg = {
++		.port = WS_I2C_PORT,
++		.addr = ES8311_CODEC_DEFAULT_ADDR,
++		.bus_handle = i2c_bus,
++	};
++	gpio_if = audio_codec_new_gpio();
++	data_if = audio_codec_new_i2s_data(&data_cfg);
++	ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
++	if (!gpio_if || !data_if || !ctrl_if)
++		goto out;
++
++	es8311_codec_cfg_t es_cfg = {
++		.ctrl_if = ctrl_if,
++		.gpio_if = gpio_if,
++		.codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,
++		.pa_pin = WS_PA_ENABLE,	/* amplifier on only while open */
++		.pa_reverted = false,
++		.master_mode = false,
++		.use_mclk = true,
++		.digital_mic = false,
++		.no_dac_ref = true,
++		.mclk_div = I2S_MCLK_MULTIPLE_256,
++		.hw_gain = {
++			.pa_voltage = 5.0,
++			.codec_dac_voltage = 3.3,
++		},
++	};
++	codec_if = es8311_codec_new(&es_cfg);
++	if (!codec_if)
++		goto out;
++	esp_codec_dev_cfg_t dev_cfg = {
++		.dev_type = ESP_CODEC_DEV_TYPE_IN_OUT,
++		.codec_if = codec_if,
++		.data_if = data_if,
++	};
++	dev = esp_codec_dev_new(&dev_cfg);
++	esp_codec_dev_sample_info_t sample = {
++		.sample_rate = WS_RATE,
++		.channel = WS_CHANNELS,
++		.bits_per_sample = WS_BITS,
++	};
++	out = malloc(BEEP_CHUNK * 4);
++	in = malloc(BEEP_CHUNK * 4);
++	if (!dev || !out || !in || esp_codec_dev_open(dev, &sample) != ESP_CODEC_DEV_OK) {
++		ESP_LOGW(TAG, "speaker test: codec open failed");
++		goto out;
++	}
++	esp_codec_dev_set_out_vol(dev, BEEP_VOLUME);
++	esp_codec_dev_set_in_gain(dev, WS_MIC_GAIN_DB);
++
++	/* 1 + 2: acoustic loopback through the on-board microphone */
++	play_and_listen(dev, out, in, 0, 500, 200, &rms_sil);
++	dump_codec(dev, "before tone");
++	play_and_listen(dev, out, in, 1000, 750, 100, &rms_tone);
++	dump_codec(dev, "during tone");
++	{
++		double r2 = 0;
++
++		play_and_listen(dev, out, in, 1000, 750, 0, &r2);
++		rms_tone = sqrt((rms_tone * rms_tone + r2 * r2) / 2);
++	}
++	ESP_LOGI(TAG, "speaker test: mic rms silence=%d, during 1 kHz tone=%d (%s)",
++		 (int)rms_sil, (int)rms_tone,
++		 rms_tone > 4 * rms_sil + 50 ? "tone HEARD by the microphone"
++					   : "tone NOT heard by the microphone");
++
++	/* 3: beeps for a person */
++	for (int b = 0; b < 3; b++) {
++		play_and_listen(dev, out, NULL, 660, 1000, 0, NULL);
++		play_and_listen(dev, out, NULL, 0, 500, 0, NULL);
++	}
++	esp_codec_dev_close(dev);	/* also disables both I2S channels */
++	enabled = false;
++	ESP_LOGI(TAG, "speaker test: 3 beeps played (660 Hz 1 s, volume %d)", BEEP_VOLUME);
++
++out:
++	free(out);
++	free(in);
++	if (dev)
++		esp_codec_dev_delete(dev);
++	if (codec_if)
++		audio_codec_delete_codec_if(codec_if);
++	if (ctrl_if)
++		audio_codec_delete_ctrl_if(ctrl_if);
++	if (data_if)
++		audio_codec_delete_data_if(data_if);
++	if (gpio_if)
++		audio_codec_delete_gpio_if(gpio_if);
++	if (enabled) {
++		/* error path: no DMA or interrupt may stay active for Linux */
++		i2s_channel_disable(tx);
++		i2s_channel_disable(rx);
++	}
++	if (tx)
++		i2s_del_channel(tx);
++	if (rx)
++		i2s_del_channel(rx);
++	pa_off();
++}
++
++#endif /* WS_SPEAKER_TEST */
++
 +esp_err_t ws_audio_init(void)
 +{
 +	esp_err_t err;
 +
 +	pa_off();
-+	err = init_i2s();
++	err = init_i2c();
++#ifdef WS_SPEAKER_TEST	/* -DWS_SPEAKER_TEST: boot-time speaker diagnostic */
 +	if (err == ESP_OK)
-+		err = init_i2c();
++		speaker_beep();
++#endif
++	if (err == ESP_OK)
++		err = init_i2s();
 +	if (err == ESP_OK)
 +		err = init_codec();
 +	if (err == ESP_OK)
@@ -348,13 +593,15 @@ index 0000000..779bda9
 +	/* Keep the register and IO-matrix setup, leave no live IDF transfer. */
 +	if (rx_chan)
 +		i2s_channel_disable(rx_chan);
++	if (tx_chan)
++		i2s_channel_disable(tx_chan);
 +	release_idf_dma();
 +	if (i2c_bus)
 +		release_i2c_pins();
 +
 +	if (err == ESP_OK)
-+		ESP_LOGI(TAG, "I2S1 RX master + ES8311 ADC ready for Linux: 16 kHz S16_LE stereo, mic gain %.0f dB",
-+			 WS_MIC_GAIN_DB);
++		ESP_LOGI(TAG, "I2S1 full duplex + ES8311 ADC/DAC ready for Linux: 16 kHz S16_LE stereo, mic gain %.0f dB, out volume %d",
++			 WS_MIC_GAIN_DB, WS_OUT_VOLUME);
 +	else
 +		ESP_LOGW(TAG, "audio preparation failed: %s; continuing Linux boot",
 +			 esp_err_to_name(err));
@@ -423,10 +670,10 @@ index 3bb7f94..0522104 100755
  if [[ -n "$pstore_identity" ]]; then
  	cat >>"${kernel_config_fragment}" <<'EOF'
 diff --git a/linux/dts/esp32p4-m5stamp-p4.dts b/linux/dts/esp32p4-m5stamp-p4.dts
-index 259e4eb..645675b 100644
+index 259e4eb..91eb994 100644
 --- a/linux/dts/esp32p4-m5stamp-p4.dts
 +++ b/linux/dts/esp32p4-m5stamp-p4.dts
-@@ -317,6 +317,22 @@
+@@ -317,6 +317,24 @@
  			status = "disabled";
  		};
  
@@ -443,6 +690,8 @@ index 259e4eb..645675b 100644
 +			      <0x50085000 0x1000>,
 +			      <0x500e6000 0x1000>;
 +			reg-names = "i2s", "ahb-dma", "clkrst";
++			/* speaker amplifier enable: GPIO53 (bank 1 line 21), on while playing */
++			pa-gpios = <&gpio1 21 GPIO_ACTIVE_HIGH>;
 +			status = "okay";
 +		};
 +
@@ -451,11 +700,11 @@ index 259e4eb..645675b 100644
  			compatible = "mtd-rom";
 diff --git a/linux/kernel-patches/0094-esp32p4-waveshare-audio.patch b/linux/kernel-patches/0094-esp32p4-waveshare-audio.patch
 new file mode 100644
-index 0000000..57b0cc8
+index 0000000..2968d7b
 --- /dev/null
 +++ b/linux/kernel-patches/0094-esp32p4-waveshare-audio.patch
-@@ -0,0 +1,595 @@
-+Waveshare ESP32-P4-WIFI6: ES8311 PCM device /dev/ws-audio (continuous capture).
+@@ -0,0 +1,785 @@
++Waveshare ESP32-P4-WIFI6: ES8311 PCM device /dev/ws-audio (capture + playback).
 +
 +Adapted from linux-waveshare-xc's esp32p4-xc-audio (patch 0043 there).
 +The boot shim (ws_audio.c) configures the codec and I2S1.
@@ -471,9 +720,9 @@ index 0000000..57b0cc8
 ++	depends on SOC_ESP32P4 && !MMU
 ++	help
 ++	  Minimal read/write PCM device for the ES8311 codec of the Waveshare
-++	  ESP32-P4-WIFI6: 16 kHz, S16_LE, two channels, microphone on the
-++	  left.  The boot shim configures the codec and I2S1; Linux only
-++	  starts and stops transfers on AHB-GDMA channel 2.
+++	  ESP32-P4-WIFI6: 16 kHz, S16_LE, two channels; read() records the
+++	  microphone, write() plays on the speaker.  The boot shim configures
+++	  the codec and I2S1; Linux runs DMA rings on AHB-GDMA channel 2.
 ++
 + source "drivers/misc/c2port/Kconfig"
 + source "drivers/misc/eeprom/Kconfig"
@@ -487,56 +736,64 @@ index 0000000..57b0cc8
 ++obj-$(CONFIG_ESP32P4_WS_AUDIO)	+= esp32p4-ws-audio.o
 +--- /dev/null
 ++++ b/drivers/misc/esp32p4-ws-audio.c
-+@@ -0,0 +1,562 @@
++@@ -0,0 +1,752 @@
 ++// SPDX-License-Identifier: GPL-2.0
 ++/*
 ++ * Lightweight PCM driver for the Waveshare ESP32-P4-WIFI6 (ES8311 codec).
 ++ *
-++ * Adapted from linux-waveshare-xc's esp32p4-xc-audio (Waveshare XC boards,
-++ * ES8311 + ES7210; written but never tested on hardware there).  On the
-++ * WIFI6 board the ES8311 alone does both directions: its analog microphone
-++ * input comes back on I2S DIN (GPIO11).
+++ * Started from linux-waveshare-xc's esp32p4-xc-audio.  On the WIFI6 board
+++ * the ES8311 alone does both directions: the analog microphone comes back on
+++ * I2S DIN (GPIO11), the DAC drives the on-board amplifier (enable: GPIO53)
+++ * and the SPK header.
 ++ *
-++ * The ESP-IDF boot shim (ws_audio.c) configures the I2S pin matrix, I2S1
-++ * clocks/slots and the codec, then disables its I2S channels before the
-++ * jump.  Linux keeps that configuration and owns I2S1 plus AHB-GDMA channel
-++ * pair 2.  The userspace ABI is fixed and tiny: read /dev/ws-audio,
-++ * S16_LE, 16000 Hz, two interleaved channels (the microphone is the left
-++ * one).
+++ * The ESP-IDF boot shim (ws_audio.c) configures the pins, I2S1 (full duplex:
+++ * TX master, RX a slave sharing BCLK/LRCK) and the codec, then disables its
+++ * channels before the jump.  Linux keeps that configuration and owns I2S1,
+++ * AHB-GDMA channel pair 2 and the amplifier GPIO.
 ++ *
-++ * Capture is continuous: open() starts I2S RX and a circular ring of
-++ * WS_RING_N DMA descriptors (one 4080-byte block = 63.75 ms each), the way
-++ * ESP-IDF's own I2S driver does it; read() copies completed blocks, found
-++ * through the DMA's "last EOF descriptor" register, and close() stops it.
-++ * There is no interrupt: read() sleeps in 2 ms steps while it waits.  If the
-++ * reader falls more than the ring behind, the oldest audio is lost: read()
-++ * resynchronises and the count is logged at close().  The first frame after start is a stale FIFO word and is replaced
-++ * by the second.  Only one reader at a time (-EBUSY).
+++ * Userspace ABI: /dev/ws-audio, S16_LE, 16000 Hz, two interleaved channels.
+++ *   read():  microphone (left channel; right repeats it)
+++ *   write(): speaker (the ES8311 DAC mixes both channels to the mono output)
+++ * One reader and one writer may have it open at the same time.
 ++ *
-++ * write() is the old one-shot path (one block per call, I2S restarted):
-++ * the shim currently sets I2S1 up for RX only, so playback is not wired.
+++ * While the device is open the "engine" runs: a circular ring of WS_RING_N
+++ * TX DMA descriptors (4080 bytes = 63.75 ms each) plays continuously --
+++ * silence when nothing is queued -- because in full duplex RX only gets a
+++ * clock while TX runs.  A reader adds a circular RX ring; read() hands out
+++ * completed blocks found through the DMA's "last EOF descriptor" register.
+++ * write() stages data into whole blocks and queues them ahead of the
+++ * hardware; a 30 ms work item zeroes blocks that have been played, so the
+++ * ring falls back to silence when the writer stops.  The amplifier is
+++ * switched on with the first queued block and off after the writer's last
+++ * block has played.  No interrupt: waits sleep in 2-4 ms steps.
+++ *
+++ * If a reader falls more than the ring behind, the oldest audio is lost:
+++ * read() resynchronises and counts an overrun (logged at close).  If a
+++ * writer is late, silence is played in between (counted as an underrun).
 ++ */
 ++
+++#include <linux/atomic.h>
 ++#include <linux/bitops.h>
 ++#include <linux/delay.h>
 ++#include <linux/fs.h>
+++#include <linux/gpio/consumer.h>
 ++#include <linux/io.h>
 ++#include <linux/iopoll.h>
+++#include <linux/jiffies.h>
 ++#include <linux/miscdevice.h>
 ++#include <linux/module.h>
 ++#include <linux/mutex.h>
 ++#include <linux/of.h>
 ++#include <linux/platform_device.h>
+++#include <linux/sched/signal.h>
 ++#include <linux/slab.h>
 ++#include <linux/uaccess.h>
-++#include <linux/atomic.h>
-++#include <linux/jiffies.h>
-++#include <linux/sched/signal.h>
+++#include <linux/workqueue.h>
 ++
 ++#define WS_AUDIO_RATE		16000
 ++#define WS_AUDIO_CHANNELS	2
 ++#define WS_AUDIO_BITS		16
-++#define WS_AUDIO_MAX_IO		4080
+++#define WS_BLOCK		4080	/* bytes per DMA block: 63.75 ms */
 ++
 ++#define I2S_RX_CONF		0x020
 ++#define I2S_TX_CONF		0x024
@@ -544,6 +801,7 @@ index 0000000..57b0cc8
 ++#define I2S_CONF_RESET		BIT(0)
 ++#define I2S_CONF_FIFO_RESET	BIT(1)
 ++#define I2S_CONF_START		BIT(2)
+++#define I2S_TX_STOP_EN		BIT(4)
 ++#define I2S_CONF_UPDATE		BIT(8)
 ++
 ++#define DMA_IN_INT_RAW_CH2	0x020
@@ -554,28 +812,29 @@ index 0000000..57b0cc8
 ++#define DMA_IN_CONF0_CH2	0x1f0
 ++#define DMA_IN_CONF1_CH2	0x1f4
 ++#define DMA_IN_LINK_CH2		0x200
+++#define DMA_IN_SUC_EOF_DES_ADDR_CH2	0x208
 ++#define DMA_IN_PERI_SEL_CH2	0x220
 ++#define DMA_OUT_CONF0_CH2	0x250
 ++#define DMA_OUT_CONF1_CH2	0x254
 ++#define DMA_OUT_LINK_CH2	0x260
+++#define DMA_OUT_EOF_DES_ADDR_CH2	0x268
 ++#define DMA_OUT_PERI_SEL_CH2	0x280
-++#define DMA_IN_SUC_EOF_DES_ADDR_CH2	0x208
 ++#define DMA_IN_LINK_ADDR_CH2	0x3b4
 ++#define DMA_OUT_LINK_ADDR_CH2	0x3c0
 ++#define DMA_ARB_CONF		0x404
 ++
-++#define DMA_IN_DONE		BIT(1)
 ++#define DMA_IN_SUC_EOF		BIT(1)
-++#define DMA_IN_DESC_ERR		BIT(3)
-++#define DMA_OUT_DESC_ERR	BIT(2)
-++#define DMA_OUT_DONE		BIT(3)
+++#define DMA_OUT_EOF		BIT(1)
 ++#define DMA_CONF_RESET		BIT(0)
-++#define DMA_OWNER_CHECK		BIT(12)
+++#define DMA_OUT_EOF_MODE	BIT(3)
 ++#define DMA_IN_LINK_STOP	BIT(1)
 ++#define DMA_IN_LINK_START	BIT(2)
 ++#define DMA_OUT_LINK_STOP	BIT(0)
 ++#define DMA_OUT_LINK_START	BIT(1)
 ++#define DMA_I2S1_TRIGGER	4
+++
+++#define DESC_SUC_EOF		BIT(30)
+++#define DESC_OWNER_DMA		BIT(31)
 ++
 ++#define CLKRST_SOC_CLK_CTRL1	0x018
 ++#define CLKRST_SOC_CLK_CTRL2	0x01c
@@ -599,30 +858,46 @@ index 0000000..57b0cc8
 ++	u32 next;
 ++};
 ++
-++/* Capture ring: 8 x 63.75 ms = 510 ms of slack for the reader. */
+++/* 8 x 63.75 ms = 510 ms per ring. */
 ++#define WS_RING_N		8
 ++#define WS_RING_STRIDE		4096	/* cache-line aligned slots */
 ++#define WS_BLOCK_JIFFIES	msecs_to_jiffies(64)
+++#define WS_JANITOR_MS		30
+++
+++struct ws_ring {
+++	struct ws_dma_desc *desc;	/* WS_RING_N descriptors */
+++	u8 *buf;			/* WS_RING_N * WS_RING_STRIDE bytes */
+++};
 ++
 ++struct ws_audio {
 ++	struct device *dev;
 ++	void __iomem *i2s;
 ++	void __iomem *dma;
 ++	void __iomem *clkrst;
+++	struct gpio_desc *pa;		/* amplifier enable, optional */
 ++	struct miscdevice miscdev;
-++	struct mutex lock; /* serializes the buffer and the DMA channel pair */
-++	struct ws_dma_desc *desc;
-++	u8 *buffer;
-++	/* continuous capture */
-++	struct ws_dma_desc *rdesc;	/* WS_RING_N descriptors */
-++	u8 *ring;			/* WS_RING_N * WS_RING_STRIDE bytes */
-++	atomic_t busy;			/* one opener at a time */
-++	bool running;
+++	struct mutex lock;		/* everything below */
+++	struct delayed_work janitor;
+++	struct ws_ring rx, tx;
+++	bool engine;			/* TX ring running */
+++	bool reader, writer;		/* openers */
+++	/* capture */
+++	bool rx_running;
 ++	bool first_block;
-++	unsigned int cons;		/* next ring slot to hand out */
+++	unsigned int cons;		/* next RX slot to hand out */
 ++	unsigned int cons_off;		/* bytes of that slot already read */
-++	unsigned long last_progress;	/* jiffies of the last consumed block */
+++	unsigned long last_progress;
 ++	unsigned long overruns;
+++	/* playback */
+++	bool pa_on;
+++	bool queued[WS_RING_N];		/* slot holds data not yet played */
+++	unsigned int ahead;		/* queued slots */
+++	unsigned int wnext;		/* next slot to queue */
+++	int tx_last;			/* last TX slot reported done */
+++	unsigned long tx_reaped;	/* jiffies of the last reap */
+++	u8 *stage;			/* WS_BLOCK bytes being filled by write() */
+++	unsigned int stage_len;
+++	unsigned long underruns;
 ++};
 ++
 ++static void ws_cache_writeback(const void *addr, size_t size)
@@ -661,6 +936,8 @@ index 0000000..57b0cc8
 ++	int ret;
 ++
 ++	value = readl(conf) & ~I2S_CONF_START;
+++	if (!capture)
+++		value &= ~I2S_TX_STOP_EN;	/* keep BCLK/LRCK running */
 ++	writel(value | I2S_CONF_RESET | I2S_CONF_FIFO_RESET, conf);
 ++	writel(value & ~(I2S_CONF_RESET | I2S_CONF_FIFO_RESET), conf);
 ++	writel(value | I2S_CONF_UPDATE, conf);
@@ -678,97 +955,206 @@ index 0000000..57b0cc8
 ++	writel(readl(conf) & ~I2S_CONF_START, conf);
 ++}
 ++
-++static void ws_dma_prepare(struct ws_audio *audio, bool capture, size_t len)
+++/* Circular descriptor ring over WS_RING_N slots.  TX descriptors carry the
+++ * full length and suc_eof so every block raises an "out EOF". */
+++static phys_addr_t ws_ring_link(struct ws_ring *r, bool tx)
 ++{
-++	phys_addr_t desc_phys = virt_to_phys(audio->desc);
-++	phys_addr_t buffer_phys = virt_to_phys(audio->buffer);
+++	phys_addr_t d0 = virt_to_phys(r->desc);
+++	int i;
 ++
-++	audio->desc->control = len | (len << 12) | BIT(30) | BIT(31);
-++	audio->desc->buffer = lower_32_bits(buffer_phys);
-++	audio->desc->next = 0;
-++
-++	/* Generic dma_sync does not cover descriptor/data visibility on this
-++	 * rv32imac NOMMU build: use the P4 ROM cache operations. */
-++	ws_cache_writeback(audio->buffer, len);
-++	ws_cache_writeback(audio->desc, sizeof(*audio->desc));
-++	if (capture)
-++		ws_cache_invalidate(audio->buffer, len);
-++
-++	if (capture) {
-++		writel(DMA_IN_LINK_STOP, audio->dma + DMA_IN_LINK_CH2);
-++		writel(DMA_CONF_RESET, audio->dma + DMA_IN_CONF0_CH2);
-++		writel(0, audio->dma + DMA_IN_CONF0_CH2);
-++		writel(DMA_OWNER_CHECK, audio->dma + DMA_IN_CONF1_CH2);
-++		writel(DMA_I2S1_TRIGGER, audio->dma + DMA_IN_PERI_SEL_CH2);
-++		writel(0xff, audio->dma + DMA_IN_INT_CLR_CH2);
-++		writel(lower_32_bits(desc_phys), audio->dma + DMA_IN_LINK_ADDR_CH2);
-++		writel(len, audio->i2s + I2S_RX_EOF_NUM);
-++		writel(DMA_IN_LINK_START, audio->dma + DMA_IN_LINK_CH2);
-++	} else {
-++		writel(DMA_OUT_LINK_STOP, audio->dma + DMA_OUT_LINK_CH2);
-++		writel(DMA_CONF_RESET, audio->dma + DMA_OUT_CONF0_CH2);
-++		writel(BIT(3), audio->dma + DMA_OUT_CONF0_CH2);
-++		writel(DMA_OWNER_CHECK, audio->dma + DMA_OUT_CONF1_CH2);
-++		writel(DMA_I2S1_TRIGGER, audio->dma + DMA_OUT_PERI_SEL_CH2);
-++		writel(0x7f, audio->dma + DMA_OUT_INT_CLR_CH2);
-++		writel(lower_32_bits(desc_phys), audio->dma + DMA_OUT_LINK_ADDR_CH2);
-++		writel(DMA_OUT_LINK_START, audio->dma + DMA_OUT_LINK_CH2);
+++	for (i = 0; i < WS_RING_N; i++) {
+++		r->desc[i].control = WS_BLOCK | DESC_OWNER_DMA;
+++		if (tx)
+++			r->desc[i].control |= (WS_BLOCK << 12) | DESC_SUC_EOF;
+++		r->desc[i].buffer = lower_32_bits(virt_to_phys(r->buf + i * WS_RING_STRIDE));
+++		r->desc[i].next = lower_32_bits(d0 + ((i + 1) % WS_RING_N) *
+++						sizeof(struct ws_dma_desc));
 ++	}
+++	ws_cache_writeback(r->desc, WS_RING_N * sizeof(struct ws_dma_desc));
+++	return d0;
 ++}
 ++
-++static void ws_dma_stop(struct ws_audio *audio, bool capture)
+++static int ws_desc_index(struct ws_ring *r, u32 addr)
 ++{
-++	writel(capture ? DMA_IN_LINK_STOP : DMA_OUT_LINK_STOP,
-++	       audio->dma + (capture ? DMA_IN_LINK_CH2 : DMA_OUT_LINK_CH2));
+++	u32 d0 = lower_32_bits(virt_to_phys(r->desc));
+++
+++	if (addr < d0 || addr >= d0 + WS_RING_N * sizeof(struct ws_dma_desc))
+++		return -1;
+++	return (addr - d0) / sizeof(struct ws_dma_desc);
 ++}
 ++
-++static int ws_audio_transfer(struct ws_audio *audio, bool capture, size_t len)
+++/* ---- engine: TX ring, always running while the device is open ---- */
+++
+++static int ws_engine_start(struct ws_audio *audio)
 ++{
-++	void __iomem *status = audio->dma +
-++		(capture ? DMA_IN_INT_RAW_CH2 : DMA_OUT_INT_RAW_CH2);
-++	u32 done = capture ? DMA_IN_DONE : DMA_OUT_DONE;
-++	u32 error = capture ? DMA_IN_DESC_ERR : DMA_OUT_DESC_ERR;
-++	u32 value;
+++	phys_addr_t d0;
 ++	int ret;
 ++
 ++	ws_enable_clocks(audio);
-++	ws_dma_prepare(audio, capture, len);
-++	ret = ws_i2s_start(audio, capture);
-++	if (ret)
-++		goto stop_dma;
+++	memset(audio->tx.buf, 0, WS_RING_N * WS_RING_STRIDE);
+++	ws_cache_writeback(audio->tx.buf, WS_RING_N * WS_RING_STRIDE);
+++	d0 = ws_ring_link(&audio->tx, true);
+++	memset(audio->queued, 0, sizeof(audio->queued));
+++	audio->ahead = 0;
+++	audio->stage_len = 0;
+++	/* desc 0 plays first: treat slot N-1 as "last done" */
+++	audio->tx_last = WS_RING_N - 1;
+++	audio->wnext = 1;
+++	audio->tx_reaped = jiffies;
 ++
-++	/* 4080 bytes = 63.75 ms at 16 kHz stereo S16; 500 ms is "no clock". */
-++	ret = readl_poll_timeout(status, value, value & (done | error), 10, 500000);
-++	ws_i2s_stop(audio, capture);
-++	if (!ret && (value & error))
-++		ret = -EIO;
-++	if (!ret && capture)
-++		ws_cache_invalidate(audio->buffer, len);
+++	writel(DMA_OUT_LINK_STOP, audio->dma + DMA_OUT_LINK_CH2);
+++	writel(DMA_CONF_RESET, audio->dma + DMA_OUT_CONF0_CH2);
+++	writel(DMA_OUT_EOF_MODE, audio->dma + DMA_OUT_CONF0_CH2);
+++	writel(0, audio->dma + DMA_OUT_CONF1_CH2);	/* no owner check: circular */
+++	writel(DMA_I2S1_TRIGGER, audio->dma + DMA_OUT_PERI_SEL_CH2);
+++	writel(0xff, audio->dma + DMA_OUT_INT_CLR_CH2);
+++	writel(lower_32_bits(d0), audio->dma + DMA_OUT_LINK_ADDR_CH2);
+++	writel(DMA_OUT_LINK_START, audio->dma + DMA_OUT_LINK_CH2);
 ++
-++stop_dma:
-++	ws_dma_stop(audio, capture);
-++	if (ret == -ETIMEDOUT)
-++		dev_warn_ratelimited(audio->dev, "%s DMA timed out (no I2S clock?)\n",
-++				     capture ? "capture" : "playback");
-++	return ret;
+++	ret = ws_i2s_start(audio, false);
+++	if (ret) {
+++		writel(DMA_OUT_LINK_STOP, audio->dma + DMA_OUT_LINK_CH2);
+++		dev_warn(audio->dev, "I2S TX did not start (%d)\n", ret);
+++		return ret;
+++	}
+++	audio->engine = true;
+++	schedule_delayed_work(&audio->janitor, msecs_to_jiffies(WS_JANITOR_MS));
+++	return 0;
 ++}
 ++
-++static void ws_ring_start(struct ws_audio *audio)
+++static void ws_engine_stop(struct ws_audio *audio)
 ++{
-++	phys_addr_t d0 = virt_to_phys(audio->rdesc);
-++	int i;
+++	if (!audio->engine)
+++		return;
+++	ws_i2s_stop(audio, false);
+++	writel(DMA_OUT_LINK_STOP, audio->dma + DMA_OUT_LINK_CH2);
+++	audio->engine = false;
+++}
 ++
-++	ws_enable_clocks(audio);
-++	for (i = 0; i < WS_RING_N; i++) {
-++		audio->rdesc[i].control = WS_AUDIO_MAX_IO | BIT(31); /* size, owner DMA */
-++		audio->rdesc[i].buffer = lower_32_bits(virt_to_phys(audio->ring +
-++							i * WS_RING_STRIDE));
-++		audio->rdesc[i].next = lower_32_bits(d0 + ((i + 1) % WS_RING_N) *
-++						     sizeof(struct ws_dma_desc));
+++static void ws_pa(struct ws_audio *audio, bool on)
+++{
+++	if (!audio->pa || audio->pa_on == on)
+++		return;
+++	gpiod_set_value_cansleep(audio->pa, on);
+++	audio->pa_on = on;
+++}
+++
+++/* Account for TX blocks the hardware has finished; zero them so the ring
+++ * plays silence once the writer stops.  Called with the lock held. */
+++static void ws_tx_reap(struct ws_audio *audio)
+++{
+++	int idx;
+++
+++	if (!(readl(audio->dma + DMA_OUT_INT_RAW_CH2) & DMA_OUT_EOF))
+++		return;
+++	idx = ws_desc_index(&audio->tx, readl(audio->dma + DMA_OUT_EOF_DES_ADDR_CH2));
+++	if (idx < 0 || idx == audio->tx_last)
+++		return;
+++
+++	if (time_after(jiffies, audio->tx_reaped + (WS_RING_N - 1) * WS_BLOCK_JIFFIES)) {
+++		/* not reaped for a whole ring: everything queued has played */
+++		int s;
+++
+++		for (s = 0; s < WS_RING_N; s++) {
+++			if (audio->queued[s]) {
+++				memset(audio->tx.buf + s * WS_RING_STRIDE, 0, WS_BLOCK);
+++				ws_cache_writeback(audio->tx.buf + s * WS_RING_STRIDE, WS_BLOCK);
+++				audio->queued[s] = false;
+++			}
+++		}
+++		audio->ahead = 0;
+++	} else {
+++		int s = audio->tx_last;
+++
+++		while (s != idx) {
+++			s = (s + 1) % WS_RING_N;
+++			if (audio->queued[s]) {
+++				memset(audio->tx.buf + s * WS_RING_STRIDE, 0, WS_BLOCK);
+++				ws_cache_writeback(audio->tx.buf + s * WS_RING_STRIDE, WS_BLOCK);
+++				audio->queued[s] = false;
+++				audio->ahead--;
+++			}
+++		}
 ++	}
-++	ws_cache_writeback(audio->rdesc, WS_RING_N * sizeof(struct ws_dma_desc));
-++	ws_cache_writeback(audio->ring, WS_RING_N * WS_RING_STRIDE);
-++	ws_cache_invalidate(audio->ring, WS_RING_N * WS_RING_STRIDE);
+++	audio->tx_last = idx;
+++	audio->tx_reaped = jiffies;
+++}
+++
+++static void ws_janitor(struct work_struct *work)
+++{
+++	struct ws_audio *audio = container_of(to_delayed_work(work), struct ws_audio, janitor);
+++
+++	mutex_lock(&audio->lock);
+++	if (audio->engine) {
+++		ws_tx_reap(audio);
+++		schedule_delayed_work(&audio->janitor, msecs_to_jiffies(WS_JANITOR_MS));
+++	}
+++	mutex_unlock(&audio->lock);
+++}
+++
+++/* Queue the staged block.  Waits (lock dropped) while the ring is full. */
+++static int ws_tx_commit(struct ws_audio *audio)
+++{
+++	u8 *slot;
+++
+++	for (;;) {
+++		ws_tx_reap(audio);
+++		if (audio->ahead == 0) {
+++			/* idle or late: start right after the block now playing */
+++			audio->wnext = (audio->tx_last + 2) % WS_RING_N;
+++			if (audio->pa_on)
+++				audio->underruns++;
+++		}
+++		if (audio->ahead < WS_RING_N - 2)
+++			break;
+++		mutex_unlock(&audio->lock);
+++		usleep_range(3000, 5000);
+++		mutex_lock(&audio->lock);
+++		if (signal_pending(current))
+++			return -ERESTARTSYS;
+++	}
+++	slot = audio->tx.buf + audio->wnext * WS_RING_STRIDE;
+++	memcpy(slot, audio->stage, WS_BLOCK);
+++	ws_cache_writeback(slot, WS_BLOCK);
+++	audio->queued[audio->wnext] = true;
+++	audio->ahead++;
+++	audio->wnext = (audio->wnext + 1) % WS_RING_N;
+++	audio->stage_len = 0;
+++	ws_pa(audio, true);
+++	return 0;
+++}
+++
+++/* Writer closing: queue the partial block, let everything play, amp off. */
+++static void ws_tx_drain(struct ws_audio *audio)
+++{
+++	unsigned long deadline = jiffies + (WS_RING_N + 2) * WS_BLOCK_JIFFIES;
+++
+++	if (audio->stage_len) {
+++		memset(audio->stage + audio->stage_len, 0, WS_BLOCK - audio->stage_len);
+++		ws_tx_commit(audio);
+++	}
+++	while (audio->ahead && time_before(jiffies, deadline)) {
+++		mutex_unlock(&audio->lock);
+++		usleep_range(5000, 8000);
+++		mutex_lock(&audio->lock);
+++		ws_tx_reap(audio);
+++	}
+++	/* one more block of silence before the amplifier goes off (no pop) */
+++	mutex_unlock(&audio->lock);
+++	msleep(70);
+++	mutex_lock(&audio->lock);
+++	ws_pa(audio, false);
+++}
+++
+++/* ---- capture: RX ring ---- */
+++
+++static int ws_rx_start(struct ws_audio *audio)
+++{
+++	phys_addr_t d0;
+++
+++	ws_cache_writeback(audio->rx.buf, WS_RING_N * WS_RING_STRIDE);
+++	ws_cache_invalidate(audio->rx.buf, WS_RING_N * WS_RING_STRIDE);
+++	d0 = ws_ring_link(&audio->rx, false);
 ++
 ++	writel(DMA_IN_LINK_STOP, audio->dma + DMA_IN_LINK_CH2);
 ++	writel(DMA_CONF_RESET, audio->dma + DMA_IN_CONF0_CH2);
@@ -777,59 +1163,53 @@ index 0000000..57b0cc8
 ++	writel(DMA_I2S1_TRIGGER, audio->dma + DMA_IN_PERI_SEL_CH2);
 ++	writel(0xff, audio->dma + DMA_IN_INT_CLR_CH2);
 ++	writel(lower_32_bits(d0), audio->dma + DMA_IN_LINK_ADDR_CH2);
-++	writel(WS_AUDIO_MAX_IO, audio->i2s + I2S_RX_EOF_NUM);
+++	writel(WS_BLOCK, audio->i2s + I2S_RX_EOF_NUM);
 ++	writel(DMA_IN_LINK_START, audio->dma + DMA_IN_LINK_CH2);
 ++
 ++	audio->cons = 0;
 ++	audio->cons_off = 0;
 ++	audio->first_block = true;
 ++	audio->last_progress = jiffies;
-++	audio->running = !ws_i2s_start(audio, true);
-++	if (!audio->running) {
+++	audio->overruns = 0;
+++	if (ws_i2s_start(audio, true)) {
 ++		writel(DMA_IN_LINK_STOP, audio->dma + DMA_IN_LINK_CH2);
 ++		dev_warn(audio->dev, "capture: I2S RX did not start\n");
+++		return -EIO;
 ++	}
+++	audio->rx_running = true;
+++	return 0;
 ++}
 ++
-++static void ws_ring_stop(struct ws_audio *audio)
+++static void ws_rx_stop(struct ws_audio *audio)
 ++{
-++	if (!audio->running)
+++	if (!audio->rx_running)
 ++		return;
 ++	ws_i2s_stop(audio, true);
 ++	writel(DMA_IN_LINK_STOP, audio->dma + DMA_IN_LINK_CH2);
-++	audio->running = false;
+++	audio->rx_running = false;
 ++}
 ++
-++/* Index of the newest completed ring slot, or -1 if none yet. */
-++static int ws_ring_newest(struct ws_audio *audio)
+++/* Index of the newest completed RX slot, or -1 if none yet. */
+++static int ws_rx_newest(struct ws_audio *audio)
 ++{
-++	u32 raw = readl(audio->dma + DMA_IN_INT_RAW_CH2);
-++	u32 addr, d0 = lower_32_bits(virt_to_phys(audio->rdesc));
-++
-++	if (!(raw & DMA_IN_SUC_EOF))
+++	if (!(readl(audio->dma + DMA_IN_INT_RAW_CH2) & DMA_IN_SUC_EOF))
 ++		return -1;
-++	addr = readl(audio->dma + DMA_IN_SUC_EOF_DES_ADDR_CH2);
-++	if (addr < d0 || addr >= d0 + WS_RING_N * sizeof(struct ws_dma_desc))
-++		return -1;
-++	return (addr - d0) / sizeof(struct ws_dma_desc);
+++	return ws_desc_index(&audio->rx, readl(audio->dma + DMA_IN_SUC_EOF_DES_ADDR_CH2));
 ++}
 ++
-++/* Wait until ring slot audio->cons is complete.  0, or -ETIMEDOUT. */
-++static int ws_ring_wait(struct ws_audio *audio)
+++/* Wait until RX slot audio->cons is complete.  0, or a negative error.
+++ * Called with the lock held; drops it while sleeping. */
+++static int ws_rx_wait(struct ws_audio *audio)
 ++{
 ++	unsigned long deadline = jiffies + msecs_to_jiffies(500);
 ++
 ++	for (;;) {
-++		int newest = ws_ring_newest(audio);
+++		int newest = ws_rx_newest(audio);
 ++
 ++		if (newest >= 0) {
 ++			unsigned int avail = (newest - audio->cons + 1 + WS_RING_N) % WS_RING_N;
 ++
-++			/*
-++			 * More than a ring of time without consuming: the DMA
-++			 * has lapped the reader and avail is meaningless.
-++			 * Jump to the newest block.
-++			 */
+++			/* more than a ring without consuming: the DMA lapped us */
 ++			if (time_after(jiffies, audio->last_progress +
 ++				       (WS_RING_N - 1) * WS_BLOCK_JIFFIES)) {
 ++				audio->overruns++;
@@ -843,76 +1223,83 @@ index 0000000..57b0cc8
 ++		}
 ++		if (time_after(jiffies, deadline))
 ++			return -ETIMEDOUT;
+++		mutex_unlock(&audio->lock);
+++		usleep_range(2000, 4000);
+++		mutex_lock(&audio->lock);
 ++		if (signal_pending(current))
 ++			return -ERESTARTSYS;
-++		usleep_range(2000, 4000);
 ++	}
 ++}
 ++
-++static ssize_t ws_ring_read(struct ws_audio *audio, char __user *buf, size_t count)
-++{
-++	size_t done = 0;
-++
-++	count &= ~3UL;
-++	while (done < count) {
-++		u8 *slot = audio->ring + audio->cons * WS_RING_STRIDE;
-++		size_t n;
-++		int ret;
-++
-++		if (audio->cons_off == 0) {
-++			ret = ws_ring_wait(audio);
-++			if (ret) {
-++				if (done)
-++					break;
-++				if (ret == -ETIMEDOUT)
-++					dev_warn_ratelimited(audio->dev,
-++						"capture DMA timed out (no I2S clock?)\n");
-++				return ret;
-++			}
-++			slot = audio->ring + audio->cons * WS_RING_STRIDE;
-++			ws_cache_invalidate(slot, WS_AUDIO_MAX_IO);
-++			if (audio->first_block) {
-++				/* stale FIFO word before the first real frame */
-++				memcpy(slot, slot + 4, 4);
-++				audio->first_block = false;
-++			}
-++		}
-++		n = min_t(size_t, count - done, WS_AUDIO_MAX_IO - audio->cons_off);
-++		if (copy_to_user(buf + done, slot + audio->cons_off, n))
-++			return done ? done : -EFAULT;
-++		done += n;
-++		audio->cons_off += n;
-++		if (audio->cons_off >= WS_AUDIO_MAX_IO) {
-++			audio->cons_off = 0;
-++			audio->cons = (audio->cons + 1) % WS_RING_N;
-++			audio->last_progress = jiffies;
-++		}
-++	}
-++	return done;
-++}
+++/* ---- file operations ---- */
 ++
 ++static int ws_audio_open(struct inode *inode, struct file *file)
 ++{
 ++	struct miscdevice *miscdev = file->private_data;
 ++	struct ws_audio *audio = container_of(miscdev, struct ws_audio, miscdev);
+++	bool rd = file->f_mode & FMODE_READ, wr = file->f_mode & FMODE_WRITE;
+++	int ret = 0;
 ++
-++	if (atomic_cmpxchg(&audio->busy, 0, 1))
-++		return -EBUSY;
+++	mutex_lock(&audio->lock);
+++	if ((rd && audio->reader) || (wr && audio->writer)) {
+++		ret = -EBUSY;
+++		goto out;
+++	}
+++	if (!audio->engine) {
+++		ret = ws_engine_start(audio);
+++		if (ret)
+++			goto out;
+++	}
+++	if (rd) {
+++		ret = ws_rx_start(audio);
+++		if (ret)
+++			goto out_stop;
+++		audio->reader = true;
+++	}
+++	if (wr) {
+++		audio->writer = true;
+++		audio->stage_len = 0;
+++		audio->underruns = 0;
+++	}
 ++	file->private_data = audio;
+++	mutex_unlock(&audio->lock);
 ++	return nonseekable_open(inode, file);
+++
+++out_stop:
+++	if (!audio->reader && !audio->writer)
+++		ws_engine_stop(audio);
+++out:
+++	mutex_unlock(&audio->lock);
+++	return ret;
 ++}
 ++
 ++static int ws_audio_release(struct inode *inode, struct file *file)
 ++{
 ++	struct ws_audio *audio = file->private_data;
+++	bool rd = file->f_mode & FMODE_READ, wr = file->f_mode & FMODE_WRITE;
 ++
 ++	mutex_lock(&audio->lock);
-++	ws_ring_stop(audio);
+++	if (wr && audio->writer) {
+++		ws_tx_drain(audio);
+++		audio->writer = false;
+++		if (audio->underruns)
+++			dev_info(audio->dev, "playback: %lu underrun(s) (writer too slow)\n",
+++				 audio->underruns);
+++	}
+++	if (rd && audio->reader) {
+++		ws_rx_stop(audio);
+++		audio->reader = false;
+++		if (audio->overruns)
+++			dev_info(audio->dev, "capture: %lu overrun(s) (reader too slow)\n",
+++				 audio->overruns);
+++	}
+++	if (!audio->reader && !audio->writer) {
+++		ws_pa(audio, false);
+++		ws_engine_stop(audio);
+++	}
 ++	mutex_unlock(&audio->lock);
-++	if (audio->overruns)
-++		dev_info(audio->dev, "capture: %lu overrun(s) (reader too slow)\n",
-++			 audio->overruns);
-++	atomic_set(&audio->busy, 0);
+++	if (!audio->engine)
+++		cancel_delayed_work_sync(&audio->janitor);
 ++	return 0;
 ++}
 ++
@@ -920,39 +1307,83 @@ index 0000000..57b0cc8
 ++			     size_t count, loff_t *ppos)
 ++{
 ++	struct ws_audio *audio = file->private_data;
-++	ssize_t ret;
+++	size_t done = 0;
+++	ssize_t ret = 0;
 ++
-++	if (count < 4)
+++	count &= ~3UL;
+++	if (!count)
 ++		return -EINVAL;
 ++	if (mutex_lock_interruptible(&audio->lock))
 ++		return -ERESTARTSYS;
-++	if (!audio->running) {
-++		audio->overruns = 0;
-++		ws_ring_start(audio);
+++	while (done < count) {
+++		u8 *slot;
+++		size_t n;
+++
+++		if (audio->cons_off == 0) {
+++			ret = ws_rx_wait(audio);
+++			if (ret) {
+++				if (ret == -ETIMEDOUT)
+++					dev_warn_ratelimited(audio->dev,
+++						"capture DMA timed out (no I2S clock?)\n");
+++				break;
+++			}
+++			slot = audio->rx.buf + audio->cons * WS_RING_STRIDE;
+++			ws_cache_invalidate(slot, WS_BLOCK);
+++			if (audio->first_block) {
+++				/* stale FIFO word before the first real frame */
+++				memcpy(slot, slot + 4, 4);
+++				audio->first_block = false;
+++			}
+++		}
+++		slot = audio->rx.buf + audio->cons * WS_RING_STRIDE;
+++		n = min_t(size_t, count - done, WS_BLOCK - audio->cons_off);
+++		if (copy_to_user(buf + done, slot + audio->cons_off, n)) {
+++			ret = -EFAULT;
+++			break;
+++		}
+++		done += n;
+++		audio->cons_off += n;
+++		if (audio->cons_off >= WS_BLOCK) {
+++			audio->cons_off = 0;
+++			audio->cons = (audio->cons + 1) % WS_RING_N;
+++			audio->last_progress = jiffies;
+++		}
 ++	}
-++	ret = audio->running ? ws_ring_read(audio, buf, count) : -EIO;
 ++	mutex_unlock(&audio->lock);
-++	return ret;
+++	return done ? done : ret;
 ++}
 ++
 ++static ssize_t ws_audio_write(struct file *file, const char __user *buf,
 ++			      size_t count, loff_t *ppos)
 ++{
 ++	struct ws_audio *audio = file->private_data;
-++	size_t len = min_t(size_t, count, WS_AUDIO_MAX_IO) & ~3UL;
-++	int ret;
+++	size_t done = 0;
+++	ssize_t ret = 0;
 ++
-++	if (!len)
+++	count &= ~3UL;
+++	if (!count)
 ++		return -EINVAL;
 ++	if (mutex_lock_interruptible(&audio->lock))
 ++		return -ERESTARTSYS;
-++	if (copy_from_user(audio->buffer, buf, len)) {
-++		mutex_unlock(&audio->lock);
-++		return -EFAULT;
+++	while (done < count) {
+++		size_t n = min_t(size_t, count - done, WS_BLOCK - audio->stage_len);
+++
+++		if (copy_from_user(audio->stage + audio->stage_len, buf + done, n)) {
+++			ret = -EFAULT;
+++			break;
+++		}
+++		audio->stage_len += n;
+++		done += n;
+++		if (audio->stage_len == WS_BLOCK) {
+++			ret = ws_tx_commit(audio);
+++			if (ret) {
+++				audio->stage_len = 0;
+++				break;
+++			}
+++		}
 ++	}
-++	ret = ws_audio_transfer(audio, false, len);
 ++	mutex_unlock(&audio->lock);
-++	return ret ? ret : len;
+++	return done ? done : ret;
 ++}
 ++
 ++static const struct file_operations ws_audio_fops = {
@@ -963,11 +1394,29 @@ index 0000000..57b0cc8
 ++	.write = ws_audio_write,
 ++};
 ++
+++static int ws_alloc_ring(struct device *dev, struct ws_ring *r)
+++{
+++	phys_addr_t b, d;
+++
+++	r->buf = devm_kmalloc(dev, WS_RING_N * WS_RING_STRIDE, GFP_KERNEL);
+++	r->desc = devm_kcalloc(dev, WS_RING_N, sizeof(*r->desc), GFP_KERNEL);
+++	if (!r->buf || !r->desc)
+++		return -ENOMEM;
+++	b = virt_to_phys(r->buf);
+++	d = virt_to_phys(r->desc);
+++	if (upper_32_bits(b) || upper_32_bits(d) ||
+++	    b < 0x40000000 || b + WS_RING_N * WS_RING_STRIDE > 0x4ffc0000 ||
+++	    d < 0x40000000 || d >= 0x4ffc0000) {
+++		dev_err(dev, "DMA ring outside the ESP32-P4 DMA range\n");
+++		return -ERANGE;
+++	}
+++	return 0;
+++}
+++
 ++static int ws_audio_probe(struct platform_device *pdev)
 ++{
 ++	struct device *dev = &pdev->dev;
 ++	struct ws_audio *audio;
-++	phys_addr_t desc_phys, buffer_phys;
 ++	int ret;
 ++
 ++	audio = devm_kzalloc(dev, sizeof(*audio), GFP_KERNEL);
@@ -983,45 +1432,34 @@ index 0000000..57b0cc8
 ++	audio->clkrst = devm_platform_ioremap_resource_byname(pdev, "clkrst");
 ++	if (IS_ERR(audio->clkrst))
 ++		return PTR_ERR(audio->clkrst);
+++	audio->pa = devm_gpiod_get_optional(dev, "pa", GPIOD_OUT_LOW);
+++	if (IS_ERR(audio->pa))
+++		return dev_err_probe(dev, PTR_ERR(audio->pa), "amplifier GPIO\n");
 ++
-++	audio->buffer = devm_kmalloc(dev, WS_AUDIO_MAX_IO, GFP_KERNEL);
-++	audio->desc = devm_kzalloc(dev, sizeof(*audio->desc), GFP_KERNEL);
-++	audio->ring = devm_kmalloc(dev, WS_RING_N * WS_RING_STRIDE, GFP_KERNEL);
-++	audio->rdesc = devm_kcalloc(dev, WS_RING_N, sizeof(*audio->rdesc), GFP_KERNEL);
-++	if (!audio->buffer || !audio->desc || !audio->ring || !audio->rdesc)
+++	ret = ws_alloc_ring(dev, &audio->rx);
+++	if (!ret)
+++		ret = ws_alloc_ring(dev, &audio->tx);
+++	if (ret)
+++		return ret;
+++	audio->stage = devm_kmalloc(dev, WS_BLOCK, GFP_KERNEL);
+++	if (!audio->stage)
 ++		return -ENOMEM;
-++	if (virt_to_phys(audio->ring) < 0x40000000 ||
-++	    virt_to_phys(audio->ring) + WS_RING_N * WS_RING_STRIDE > 0x4ffc0000 ||
-++	    virt_to_phys(audio->rdesc) < 0x40000000 ||
-++	    virt_to_phys(audio->rdesc) >= 0x4ffc0000) {
-++		dev_err(dev, "capture ring outside the ESP32-P4 DMA range\n");
-++		return -ERANGE;
-++	}
-++	atomic_set(&audio->busy, 0);
-++	desc_phys = virt_to_phys(audio->desc);
-++	buffer_phys = virt_to_phys(audio->buffer);
-++	if (upper_32_bits(desc_phys) || upper_32_bits(buffer_phys) ||
-++	    desc_phys < 0x40000000 || desc_phys >= 0x4ffc0000 ||
-++	    buffer_phys < 0x40000000 ||
-++	    buffer_phys + WS_AUDIO_MAX_IO > 0x4ffc0000) {
-++		dev_err(dev, "DMA memory outside the ESP32-P4 addressable range\n");
-++		return -ERANGE;
-++	}
 ++
 ++	mutex_init(&audio->lock);
+++	INIT_DELAYED_WORK(&audio->janitor, ws_janitor);
 ++	audio->miscdev.minor = MISC_DYNAMIC_MINOR;
 ++	audio->miscdev.name = "ws-audio";
 ++	audio->miscdev.fops = &ws_audio_fops;
 ++	audio->miscdev.parent = dev;
-++	/* Single-user board: let m5 record without root. */
+++	/* Single-user board: let m5 record and play without root. */
 ++	audio->miscdev.mode = 0666;
 ++	ret = misc_register(&audio->miscdev);
 ++	if (ret)
 ++		return ret;
 ++	platform_set_drvdata(pdev, audio);
-++	ws_enable_clocks(audio);
-++	dev_info(dev, "/dev/ws-audio: %d Hz, %d-bit, %d-channel PCM (mic = left), continuous capture, %d x %d-byte ring\n",
-++		 WS_AUDIO_RATE, WS_AUDIO_BITS, WS_AUDIO_CHANNELS, WS_RING_N, WS_AUDIO_MAX_IO);
+++	dev_info(dev, "/dev/ws-audio: %d Hz, %d-bit, %d-channel PCM, capture + playback, %d x %d-byte rings%s\n",
+++		 WS_AUDIO_RATE, WS_AUDIO_BITS, WS_AUDIO_CHANNELS, WS_RING_N, WS_BLOCK,
+++		 audio->pa ? ", amplifier on GPIO" : ", no amplifier GPIO");
 ++	return 0;
 ++}
 ++
@@ -1030,6 +1468,7 @@ index 0000000..57b0cc8
 ++	struct ws_audio *audio = platform_get_drvdata(pdev);
 ++
 ++	misc_deregister(&audio->miscdev);
+++	cancel_delayed_work_sync(&audio->janitor);
 ++}
 ++
 ++static const struct of_device_id ws_audio_of_match[] = {

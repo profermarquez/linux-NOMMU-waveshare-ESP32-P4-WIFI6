@@ -1258,21 +1258,24 @@ nohup servidor-web > /home/m5/servidor-web.log 2>&1 &
   `largest_free` en `/sys/kernel/board/nommu_pool` antes de arrancar
   otro.
 
-### 11.12 Micrófono y reconocimiento de voz
+### 11.12 Micrófono, parlante y reconocimiento de voz
 
 La placa trae un micrófono analógico soldado, conectado a la entrada del
-códec **ES8311** (I2C 0x18).  El ES8311 manda el audio al P4 por **I2S**:
-MCLK 13, BCLK 12, LRCK 10, DIN 11 (pines del BSP de Waveshare).  Desde el
-2026-11-24 Linux lo puede grabar.  Probado en la placa.
+códec **ES8311** (I2C 0x18).  El ES8311 también tiene una salida que va a
+un amplificador (encendido por GPIO53) y al conector **SPK** (MX1.25 de 2
+pines, para un parlante de 8 Ω y 2 W).  El códec se comunica con el P4 por
+**I2S**: MCLK 13, BCLK 12, LRCK 10, DOUT 9, DIN 11 (pines del BSP de
+Waveshare).  Desde el 2026-11-24 Linux graba, y desde el 2026-11-26
+reproduce.  Probado en la placa.
 
 **Hace falta otro firmware.**  Las imágenes de `firmware/` de este
 repositorio **no** traen el audio.  Se agregan tres piezas:
 
 | Dirección | Pieza | Qué hace |
 |---|---|---|
-| 0x10000 | boot shim con `ws_audio.c` | configura el ES8311 (ganancia 24 dB) e I2S1 como receptor maestro; mide el nivel del micrófono al arrancar |
-| 0x90000 | kernel con el parche 0094 | `/dev/ws-audio`: captura continua, 16 kHz, 16 bits, estéreo (el micrófono es el canal izquierdo) |
-| 0xF10000 | DTB con el nodo `audio@500c7000` | — |
+| 0x10000 | boot shim con `ws_audio.c` | configura el ES8311 (micrófono 24 dB, salida volumen 90) e I2S1 en full duplex; mide el nivel del micrófono al arrancar |
+| 0x90000 | kernel con el parche 0094 | `/dev/ws-audio`, 16 kHz, 16 bits, estéreo: `read()` graba (el micrófono es el canal izquierdo) y `write()` reproduce; enciende el amplificador solo mientras suena |
+| 0xF10000 | DTB con el nodo `audio@500c7000` | incluye `pa-gpios`, el amplificador en GPIO53 |
 
 El rootfs, el bootloader, la tabla de particiones, `/boot` y el C6 no
 cambian.  Las fuentes están en `source/0002-waveshare-audio.patch`, que se
@@ -1283,7 +1286,7 @@ por el shim antes de Linux:
 
 ```
 ws_audio: mic L rms=107 peak=326 dc=0 (6400 frames, gain 24 dB)
-ws_audio: I2S1 RX master + ES8311 ADC ready for Linux: 16 kHz S16_LE stereo, mic gain 24 dB
+ws_audio: I2S1 full duplex + ES8311 ADC/DAC ready for Linux: 16 kHz S16_LE stereo, mic gain 24 dB, out volume 90
 ```
 
 Un micrófono que no funciona da valores cerca de 0 o fijos.
@@ -1317,6 +1320,48 @@ Probado en la placa:
   audio tardaron 14 s, y se perdieron unos 4 s.
 - Si eso pasa, `grabar` avisa, y el kernel lo anota (`dmesg | grep
   overrun`).
+
+#### Reproducir (`reproducir`)
+
+Conectá el parlante al conector **SPK** con la placa apagada: el cable rojo
+al `+` y el negro al `−` (los que están impresos en la placa).  El conector
+espera 8 Ω.  Si no sabés la impedancia, dos parlantes en serie son lo más
+seguro; nunca en paralelo.
+
+```bash
+make -C examples/audio deploy PLACA=stamp-p4.local      # instala grabar y reproducir
+```
+
+```sh
+reproducir /home/m5/voz.wav               # una grabación
+reproducir -v 40 /home/m5/voz.wav         # al 40 % del volumen (por defecto 70 %)
+reproducir uno.wav dos.wav                # varias, una tras otra
+reproducir -t 440 -s 60                   # un tono de 440 Hz durante 60 s
+reproducir -t 1000 -s 300 -v 30           # 5 minutos a 1 kHz, bajito
+```
+
+- **Archivos:** WAV PCM de 16 bits, mono o estéreo, de 4 a 48 kHz.  Si no
+  es de 16 kHz lo convierte (interpolación lineal): suena a la velocidad
+  correcta, con menos calidad.
+- **Memoria:** lee el archivo de a poco, así que las grabaciones largas no
+  necesitan más memoria.
+- **`Ctrl+C`** corta.  El kernel deja sonar el medio segundo que ya tiene en
+  la cola y después apaga el amplificador.
+- Se puede **grabar y reproducir a la vez** desde dos programas: uno lee
+  `/dev/ws-audio` y otro escribe.
+
+Probado en la placa (2026-11-26):
+
+| Prueba | Resultado |
+|---|---|
+| tono de 10 s (`-t 440 -s 10`) | se escuchó; 10 s en 10,16 s |
+| grabar 4 s mientras suena un tono de 1 kHz | el micrófono midió 2105, contra 37 en silencio |
+| reproducir esa grabación | 4,0 s en 4,16 s |
+
+- **Igual que al grabar, escribir en la microSD mientras suena hace cortes.**
+  La primera prueba, justo después de copiar el programa a la tarjeta,
+  tardó 17,7 s en lugar de 10, con un silencio de unos segundos.  Después
+  de un `sync` no se repitió.  El kernel lo anota: `dmesg | grep underrun`.
 
 #### Decir "yes" o "no" (`tflm-voz`)
 
@@ -1357,10 +1402,11 @@ entrenamiento.
 
 #### Límites
 
-- **Solo grabar:** el I2S está como receptor; el parlante (DAC del ES8311 y
-  amplificador en GPIO53) no está configurado.
-- **Un programa a la vez** puede leer `/dev/ws-audio` (otro recibe
-  `EBUSY`).
+- **Un programa graba y uno reproduce a la vez.**  Un segundo programa que
+  intenta lo mismo recibe `EBUSY`.
+- **Mono:** el ES8311 tiene una sola salida; los dos canales se mezclan.
+- **El volumen es por software** (`reproducir -v`).  La ganancia del códec
+  queda fija en 90 desde el shim.
 - **El modelo de voz solo conoce "yes" y "no"** en inglés.  Para otras
   palabras hay que entrenar un modelo en la computadora.
 - **Un `tflm-voz -m -v` mostró 2 pérdidas de audio en 10 s** la primera
@@ -1370,6 +1416,19 @@ entrenamiento.
 **Volver al sistema sin audio:** grabar el shim de la v2 en 0x10000 y el
 `Image` y el DTB de `firmware/` en 0x90000 y 0xF10000 (o `./flash.sh`, que
 también borra `/boot`).
+
+**Cómo se llegó acá** (para quien quiera seguir):
+- el driver usa un anillo de DMA de 8 bloques de 63,75 ms para cada
+  dirección;
+- mientras el dispositivo está abierto el transmisor suena siempre
+  (silencio si no hay nada que reproducir): en full duplex el receptor toma
+  el reloj del transmisor;
+- un trabajo del kernel cada 30 ms limpia los bloques ya reproducidos, para
+  que vuelva al silencio cuando el programa deja de escribir;
+- los problemas que hubo, en orden: el receptor sin reloj, el canal de DMA
+  que ESP-IDF dejaba asignado, el valor viejo del FIFO al empezar, y los
+  cortes por escribir en la microSD.  Ver los commits de
+  `source/0002-waveshare-audio.patch`.
 
 ---
 

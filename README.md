@@ -2,8 +2,8 @@
 
 > **Rama v2.**  Suma a la v1 microSD, NTP/zona horaria, varias redes Wi-Fi y
 > punto de acceso, HTTPS, C++, GPIO, I2C y SPI.  Después se agregaron
-> programas en la microSD (SQLite, web, IA) y el micrófono: ver **Usar la
-> placa** más abajo.  Detalle y límites:
+> programas en la microSD (SQLite, web, IA), el micrófono y el parlante: ver
+> **Usar la placa** más abajo.  Detalle y límites:
 > **[CHANGELOG.md](CHANGELOG.md)**.  La v1 sigue en la rama `main`
 > ([docs/VOLVER-A-V1.md](docs/VOLVER-A-V1.md)).
 
@@ -37,7 +37,7 @@ v0.5.1 (perfil `m3-lab`), adaptado a esta placa.
 | SPI (GPIO21/22/23/26, `/dev/spidev1.0`) | ⚠️ loopback sin verificar |
 | SQLite, servidor web, APIs REST, TensorFlow Lite Micro (en la microSD) | ✅ |
 | Micrófono (`grabar`, `tflm-voz`) | ✅ con el firmware de audio (no está en `firmware/`) |
-| Parlante | ❌ no configurado |
+| Parlante en el conector SPK (`reproducir`) | ✅ con el firmware de audio |
 | Temperatura del chip | ⏸️ en pausa |
 | IPv6, USB OTG, segundo núcleo | ❌ |
 
@@ -84,8 +84,8 @@ a paso, backup y recuperación: **[docs/INSTALAR.md](docs/INSTALAR.md)**.
 | `docs/VOLVER-A-V1.md` | Cómo volver a la v1 (y de nuevo a la v2) |
 | `CHANGELOG.md` | Qué cambió en la v2, qué está limitado y qué falló |
 | `source/0001-waveshare-esp32-p4-wifi6-v2.patch` | Los cambios respecto del proyecto base (aplicar sobre el commit `69a7312`) |
-| `source/0002-waveshare-audio.patch` | El micrófono: shim, driver `/dev/ws-audio` y DTB (aplicar después del 0001) |
-| `examples/` | Ejemplos: shell, MicroPython (cliente y servidor HTTP, mini navegador `navegador.py`), C (`c-hello`, `c-sysinfo`, `c-gpio`), C++ (`cpp/`), SQLite y visor web de tablas (`sqlite/`), servidor web y API REST en C con Mongoose (`c-api/`), visor de imágenes en la terminal (`ver-imagen/`), TensorFlow Lite Micro (`tflm/`: seno, dígitos, voz), grabador del micrófono (`audio/`), `wifi-ejemplo.txt`.  Guía 11.9–11.12 y la sección de abajo |
+| `source/0002-waveshare-audio.patch` | Micrófono y parlante: shim, driver `/dev/ws-audio` y DTB (aplicar después del 0001) |
+| `examples/` | Ejemplos: shell, MicroPython (cliente y servidor HTTP, mini navegador `navegador.py`), C (`c-hello`, `c-sysinfo`, `c-gpio`), C++ (`cpp/`), SQLite y visor web de tablas (`sqlite/`), servidor web y API REST en C con Mongoose (`c-api/`), visor de imágenes en la terminal (`ver-imagen/`), TensorFlow Lite Micro (`tflm/`: seno, dígitos, voz), grabador y reproductor (`audio/`), `wifi-ejemplo.txt`.  Guía 11.9–11.12 y la sección de abajo |
 | `LICENSE` | GPL-2.0, la licencia del proyecto base |
 
 ## Imágenes
@@ -144,10 +144,10 @@ Lo que sigue se probó en la placa.  La guía completa está en
 
 | Carpeta | Dónde vive | Qué hay |
 |---|---|---|
-| `/home/m5/bin` | microSD (ext4, `WSDATA`) | los programas: `navegar`, `sqlite3`, `servidor-web`, `api-sqlite`, `ver-imagen`, `tflm-seno`, `tflm-mnist`, `tflm-voz`, `grabar`… |
+| `/home/m5/bin` | microSD (ext4, `WSDATA`) | los programas: `navegar`, `sqlite3`, `servidor-web`, `api-sqlite`, `ver-imagen`, `tflm-seno`, `tflm-mnist`, `tflm-voz`, `grabar`, `reproducir`… |
 | `/home/m5` | microSD | bases SQLite (`lecturas.db`, `notas.db`…), grabaciones `.wav` |
 | `/home/m5/imagenes` | microSD | dígitos de ejemplo (`sample0.png` … `sample9.png`) e imágenes propias |
-| `/home/m5/audio` | microSD | WAV de prueba de 1 s: `yes_1000ms.wav`, `no_1000ms.wav`, `silence_1000ms.wav`, `noise_1000ms.wav` |
+| `/home/m5/audio` | microSD | grabaciones, y los WAV de prueba de 1 s: `yes_1000ms.wav`, `no_1000ms.wav`, `silence_1000ms.wav`, `noise_1000ms.wav` |
 | `/home/m5/modelos` | microSD | modelos `.tflite` del ejemplo del seno |
 | `/home/m5/www` | microSD | páginas que sirve `servidor-web` |
 | `/home/m5/.micropython/lib` | microSD | módulos de MicroPython: `microdot`, `sqlite.py` |
@@ -262,7 +262,47 @@ scp -O m5@stamp-p4.local:/home/m5/voz.wav . && afplay voz.wav
 - **No escribas en la microSD mientras grabás:** la escritura ocupa el
   único núcleo por unos segundos y se pierde audio.  `grabar` ya lo evita
   (guarda en RAM, escribe al final y avisa si se perdió algo).
-- **Un solo programa a la vez** puede usar el micrófono.
+- **Un solo programa a la vez** puede usar el micrófono (y otro, a la vez,
+  el parlante).
+
+### Escuchar grabaciones en el parlante (`reproducir`)
+
+Con el mismo firmware de audio.  Conectá el parlante al conector **SPK**
+de la placa (MX1.25 de 2 pines, 8 Ω): rojo al `+`, negro al `−`, **con la
+placa apagada**.
+
+```bash
+make -C examples/audio deploy PLACA=stamp-p4.local     # desde la Mac: instala grabar y reproducir
+```
+
+```sh
+reproducir /home/m5/audio/reunion.wav        # una grabación
+reproducir -v 40 /home/m5/voz.wav            # más bajo (volumen 1–100, por defecto 70)
+reproducir uno.wav dos.wav tres.wav          # varias, una tras otra
+reproducir -t 440 -s 60                      # un tono de 440 Hz durante 60 s
+```
+
+Salida real:
+
+```
+/tmp/eco.wav: 4.0 s, 16000 Hz, mono, volumen 100 %
+     0 / 4 s     1 / 4 s     2 / 4 s     3 / 4 s   4.0 / 4.0 s
+```
+
+- Lee WAV de 16 bits, mono o estéreo, de 4 a 48 kHz.  Si no es de 16 kHz
+  lo convierte: suena a la velocidad correcta, con menos calidad.
+- `Ctrl+C` corta; el amplificador se apaga solo medio segundo después.
+- **Para pasar un audio de la Mac a la placa** (16 bits; `afconvert` viene
+  con macOS):
+  ```bash
+  afconvert -f WAVE -d LEI16@16000 -c 1 cancion.m4a cancion.wav
+  scp -O cancion.wav m5@stamp-p4.local:/home/m5/audio/
+  ```
+- Igual que al grabar: **no copies archivos a la microSD mientras suena**,
+  o habrá cortes de unos segundos.
+- Probado en la placa: un tono de 10 s sonó en 10,16 s.  Grabando mientras
+  sonaba, el micrófono midió 2105, contra 37 en silencio.  La grabación se
+  reprodujo bien.
 
 ### Decir "yes" o "no" (`tflm-voz`)
 
