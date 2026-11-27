@@ -1363,6 +1363,64 @@ Probado en la placa (2026-11-26):
   tardó 17,7 s en lugar de 10, con un silencio de unos segundos.  Después
   de un `sync` no se repitió.  El kernel lo anota: `dmesg | grep underrun`.
 
+#### Radio por internet (`radio`, `radio-rfi.sh`)
+
+Escucha una radio MP3 por `http://` en el parlante, con un cache de 30 s
+contra los cortes de la red.  Viene configurada con **RFI Monde**
+(`http://rfimonde64k.ice.infomaniak.ch/rfimonde-64.mp3`, 64 kbps).
+
+```bash
+make -C examples/audio deploy PLACA=stamp-p4.local    # desde la Mac: instala radio y radio-rfi.sh
+```
+
+Como `root`, al volumen más alto sin distorsión:
+
+```sh
+/home/m5/bin/radio-rfi.sh                                  # hasta Ctrl+C
+nohup /home/m5/bin/radio-rfi.sh > /tmp/radio.log 2>&1 &    # que siga al cerrar SSH
+killall radio                                              # pararla
+```
+
+`radio-rfi.sh` pone el DAC del ES8311 en 0 dB (registro `0x32` = `0xbf`,
+por I2C), toca al 100 % y al terminar deja el volumen como estaba.  Por
+encima de 0 dB el códec solo agrega ganancia digital: más fuerte, pero
+saturado y forzando el parlante.
+
+Directo, con otras opciones (también como `m5`):
+
+```sh
+radio                              # RFI, volumen 100 %, cache 30 s
+radio -v 60 -c 10                  # más bajo, cache de 10 s
+radio http://servidor:8000/radio.mp3   # otra radio MP3 por http
+```
+
+Salida real:
+
+```
+  icy-name:RFI monde 64a
+  cache de 256 KB (30 s a 64 kbps)
+  cache lleno (30 s), suena
+  MP3 22050 Hz, estereo, 64 kbps
+  51 s sonando, cache 29 s
+```
+
+- **Cache:** guarda el MP3 comprimido en RAM (30 s = 240 KB).  Al empezar
+  espera a llenarlo; en la prueba tardó unos 20 s, por la ráfaga inicial
+  del servidor.  Por eso suena unos 30 s atrás del vivo.
+- **Si se corta la red,** sigue sonando del cache y reconecta en segundo
+  plano.  Si el cache se vacía, espera 3 s de audio y sigue.
+- **CPU:** el decodificador (minimp3) hace las cuentas de coma flotante por
+  software, porque el compilador de la placa no usa la FPU: decodificar usa
+  ~67 %, y la radio entera ~86 %.  El cache sirve contra la red, no contra la
+  CPU: no copies archivos a la microSD ni corras programas pesados mientras
+  suena.  Radios de más de 64 kbps pueden no llegar.
+- **Solo `http://`:** TLS no entra en la CPU junto con el decodificador.
+- **Por qué no la página `ecouterradioenligne.com`:** pide su dirección de
+  audio detrás de un control anti-bots de Cloudflare.  RFI publica sus
+  propias radios en Infomaniak.
+- **Probado en la placa** (2026-11-26): sonó bien.  Con cache, en 75 s de
+  reloj: ~20 s llenando y ~55 s sonando, con el cache estable en 29–30 s.
+
 #### Decir "yes" o "no" (`tflm-voz`)
 
 Es el ejemplo `micro_speech` de TensorFlow Lite Micro, con dos modelos:

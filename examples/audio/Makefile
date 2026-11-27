@@ -30,7 +30,7 @@ CROSS ?= $(CXX_TOOLCHAIN)/host/bin/riscv32-buildroot-linux-uclibc-
 CC := $(CROSS)gcc
 FLTHDR := $(CROSS)flthdr
 
-all: grabar reproducir
+all: grabar reproducir radio
 
 grabar reproducir: %: %.c
 	$(CC) -Os -fPIC -ffunction-sections -fdata-sections -Wall -Wextra $< -o $@ \
@@ -39,12 +39,23 @@ grabar reproducir: %: %.c
 	rm -f $@.gdb
 	@echo "$@: $$(od -An -tu4 --endian=big -j 20 -N 8 $@ | awk '{print int(($$1 + $$2) / 1024)}') KB of RAM at exec"
 
+# MP3 radio: minimp3 (CC0) from ../terceros/minimp3 (descargar.sh minimp3).
+# -O2: the decoder runs on software floating point and needs the speed.
+radio: radio.c
+	@test -f ../terceros/minimp3/minimp3.h || { echo "missing minimp3.h: run sh ../terceros/descargar.sh minimp3" >&2; exit 1; }
+	$(CC) -O2 -fPIC -ffunction-sections -fdata-sections -Wall -I../terceros/minimp3 $< -o $@ \
+	  -Wl,--gc-sections -Wl,-elf2flt=-r -lm
+	$(FLTHDR) -s 65536 $@
+	rm -f $@.gdb
+	@echo "$@: $$(od -An -tu4 --endian=big -j 20 -N 8 $@ | awk '{print int(($$1 + $$2) / 1024)}') KB of RAM at exec"
+
 clean:
-	rm -f grabar grabar.gdb reproducir reproducir.gdb
+	rm -f grabar grabar.gdb reproducir reproducir.gdb radio radio.gdb
 
 endif
 
 deploy: all
 	ssh $(SSH_OPTS) $(USUARIO)@$(PLACA) 'mkdir -p $(DESTINO)'
-	scp -O $(SSH_OPTS) grabar reproducir $(USUARIO)@$(PLACA):$(DESTINO)/
-	@echo "copied grabar and reproducir to $(DESTINO)"
+	scp -O $(SSH_OPTS) grabar reproducir radio radio-rfi.sh $(USUARIO)@$(PLACA):$(DESTINO)/
+	ssh $(SSH_OPTS) $(USUARIO)@$(PLACA) 'chmod 755 $(DESTINO)/grabar $(DESTINO)/reproducir $(DESTINO)/radio $(DESTINO)/radio-rfi.sh; sync'
+	@echo "copied grabar, reproducir, radio and radio-rfi.sh to $(DESTINO)"

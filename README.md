@@ -37,7 +37,7 @@ v0.5.1 (perfil `m3-lab`), adaptado a esta placa.
 | SPI (GPIO21/22/23/26, `/dev/spidev1.0`) | ⚠️ loopback sin verificar |
 | SQLite, servidor web, APIs REST, TensorFlow Lite Micro (en la microSD) | ✅ |
 | Micrófono (`grabar`, `tflm-voz`) | ✅ con el firmware de audio (no está en `firmware/`) |
-| Parlante en el conector SPK (`reproducir`) | ✅ con el firmware de audio |
+| Parlante en el conector SPK (`reproducir`, `radio`) | ✅ con el firmware de audio |
 | Temperatura del chip | ⏸️ en pausa |
 | IPv6, USB OTG, segundo núcleo | ❌ |
 
@@ -85,7 +85,7 @@ a paso, backup y recuperación: **[docs/INSTALAR.md](docs/INSTALAR.md)**.
 | `CHANGELOG.md` | Qué cambió en la v2, qué está limitado y qué falló |
 | `source/0001-waveshare-esp32-p4-wifi6-v2.patch` | Los cambios respecto del proyecto base (aplicar sobre el commit `69a7312`) |
 | `source/0002-waveshare-audio.patch` | Micrófono y parlante: shim, driver `/dev/ws-audio` y DTB (aplicar después del 0001) |
-| `examples/` | Ejemplos: shell, MicroPython (cliente y servidor HTTP, mini navegador `navegador.py`), C (`c-hello`, `c-sysinfo`, `c-gpio`), C++ (`cpp/`), SQLite y visor web de tablas (`sqlite/`), servidor web y API REST en C con Mongoose (`c-api/`), visor de imágenes en la terminal (`ver-imagen/`), TensorFlow Lite Micro (`tflm/`: seno, dígitos, voz), grabador y reproductor (`audio/`), `wifi-ejemplo.txt`.  Guía 11.9–11.12 y la sección de abajo |
+| `examples/` | Ejemplos: shell, MicroPython (cliente y servidor HTTP, mini navegador `navegador.py`), C (`c-hello`, `c-sysinfo`, `c-gpio`), C++ (`cpp/`), SQLite y visor web de tablas (`sqlite/`), servidor web y API REST en C con Mongoose (`c-api/`), visor de imágenes en la terminal (`ver-imagen/`), TensorFlow Lite Micro (`tflm/`: seno, dígitos, voz), grabador, reproductor y radio por internet (`audio/`), `wifi-ejemplo.txt`.  Guía 11.9–11.12 y la sección de abajo |
 | `LICENSE` | GPL-2.0, la licencia del proyecto base |
 
 ## Imágenes
@@ -144,7 +144,7 @@ Lo que sigue se probó en la placa.  La guía completa está en
 
 | Carpeta | Dónde vive | Qué hay |
 |---|---|---|
-| `/home/m5/bin` | microSD (ext4, `WSDATA`) | los programas: `navegar`, `sqlite3`, `servidor-web`, `api-sqlite`, `ver-imagen`, `tflm-seno`, `tflm-mnist`, `tflm-voz`, `grabar`, `reproducir`… |
+| `/home/m5/bin` | microSD (ext4, `WSDATA`) | los programas: `navegar`, `sqlite3`, `servidor-web`, `api-sqlite`, `ver-imagen`, `tflm-seno`, `tflm-mnist`, `tflm-voz`, `grabar`, `reproducir`, `radio`, `radio-rfi.sh`… |
 | `/home/m5` | microSD | bases SQLite (`lecturas.db`, `notas.db`…), grabaciones `.wav` |
 | `/home/m5/imagenes` | microSD | dígitos de ejemplo (`sample0.png` … `sample9.png`) e imágenes propias |
 | `/home/m5/audio` | microSD | grabaciones, y los WAV de prueba de 1 s: `yes_1000ms.wav`, `no_1000ms.wav`, `silence_1000ms.wav`, `noise_1000ms.wav` |
@@ -303,6 +303,64 @@ Salida real:
 - Probado en la placa: un tono de 10 s sonó en 10,16 s.  Grabando mientras
   sonaba, el micrófono midió 2105, contra 37 en silencio.  La grabación se
   reprodujo bien.
+
+### Radio por internet (`radio`, `radio-rfi.sh`)
+
+Escucha una radio MP3 por `http://` en el parlante, con un cache de 30 s
+contra los cortes de la red.  Viene configurada con **RFI Monde**
+(`http://rfimonde64k.ice.infomaniak.ch/rfimonde-64.mp3`, 64 kbps).
+
+```bash
+make -C examples/audio deploy PLACA=stamp-p4.local    # desde la Mac: instala radio y radio-rfi.sh
+```
+
+Como `root`, al volumen más alto sin distorsión:
+
+```sh
+/home/m5/bin/radio-rfi.sh                                  # hasta Ctrl+C
+nohup /home/m5/bin/radio-rfi.sh > /tmp/radio.log 2>&1 &    # que siga al cerrar SSH
+killall radio                                              # pararla
+```
+
+`radio-rfi.sh` pone el DAC del ES8311 en 0 dB (registro `0x32` = `0xbf`,
+por I2C), toca al 100 % y al terminar deja el volumen como estaba.  Por
+encima de 0 dB el códec solo agrega ganancia digital: más fuerte, pero
+saturado y forzando el parlante.
+
+Directo, con otras opciones (también como `m5`):
+
+```sh
+radio                              # RFI, volumen 100 %, cache 30 s
+radio -v 60 -c 10                  # más bajo, cache de 10 s
+radio http://servidor:8000/radio.mp3   # otra radio MP3 por http
+```
+
+Salida real:
+
+```
+  icy-name:RFI monde 64a
+  cache de 256 KB (30 s a 64 kbps)
+  cache lleno (30 s), suena
+  MP3 22050 Hz, estereo, 64 kbps
+  51 s sonando, cache 29 s
+```
+
+- **Cache:** guarda el MP3 comprimido en RAM (30 s = 240 KB).  Al empezar
+  espera a llenarlo; en la prueba tardó unos 20 s, por la ráfaga inicial
+  del servidor.  Por eso suena unos 30 s atrás del vivo.
+- **Si se corta la red,** sigue sonando del cache y reconecta en segundo
+  plano.  Si el cache se vacía, espera 3 s de audio y sigue.
+- **CPU:** el decodificador (minimp3) hace las cuentas de coma flotante por
+  software, porque el compilador de la placa no usa la FPU: decodificar usa
+  ~67 %, y la radio entera ~86 %.  El cache sirve contra la red, no contra la
+  CPU: no copies archivos a la microSD ni corras programas pesados mientras
+  suena.  Radios de más de 64 kbps pueden no llegar.
+- **Solo `http://`:** TLS no entra en la CPU junto con el decodificador.
+- **Por qué no la página `ecouterradioenligne.com`:** pide su dirección de
+  audio detrás de un control anti-bots de Cloudflare.  RFI publica sus
+  propias radios en Infomaniak.
+- **Probado en la placa** (2026-11-26): sonó bien.  Con cache, en 75 s de
+  reloj: ~20 s llenando y ~55 s sonando, con el cache estable en 29–30 s.
 
 ### Decir "yes" o "no" (`tflm-voz`)
 

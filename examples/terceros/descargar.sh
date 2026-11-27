@@ -4,7 +4,7 @@
 #
 #   sh examples/terceros/descargar.sh            # everything
 #   sh examples/terceros/descargar.sh sqlite     # only one: sqlite, microdot,
-#                                                # mongoose, stb, tflite-micro
+#                                                # mongoose, stb, minimp3, tflite-micro
 #
 # Leaves them in examples/terceros/<name>/.  Versions and hashes are the
 # ones tested on the board (2026-11-23).
@@ -17,6 +17,7 @@ SQLITE_SHA=0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9
 MICRODOT_VER=v2.8.0
 MONGOOSE_VER=7.24
 STB_COMMIT=6b5799bae8a1fe3792691ef4b72ae26434c3e799   # stb_image v2.34
+MINIMP3_COMMIT=48e3a085f0e1a99446b34614e1e7f17f09dc2e82
 # tflite-micro has no releases: a fixed commit of the main branch.
 TFLM_COMMIT=${TFLM_COMMIT:-38a8f0f87302817ddfa99e6a995c7b71ef7118fe}
 
@@ -66,6 +67,15 @@ mongoose() {
     cd ..
 }
 
+minimp3() {
+    mkdir -p minimp3 && cd minimp3
+    base=https://raw.githubusercontent.com/lieff/minimp3/$MINIMP3_COMMIT
+    [ -f minimp3.h ] || curl -sSfLO "$base/minimp3.h"
+    [ -f LICENSE ] || curl -sSfL -o LICENSE "$base/LICENSE"
+    check minimp3.h eb4b44812cfe77a358aa1820462cc877473a8d97206009ebecd18b60a123875a
+    cd ..
+}
+
 stb() {
     mkdir -p stb && cd stb
     [ -f stb_image.h ] || curl -sSfLO "https://raw.githubusercontent.com/nothings/stb/$STB_COMMIT/stb_image.h"
@@ -90,13 +100,14 @@ tflite_micro() {
     echo "ok  tflm-tree"
 }
 
-if [ $# -eq 0 ]; then set -- sqlite microdot mongoose stb tflite-micro; fi
+if [ $# -eq 0 ]; then set -- sqlite microdot mongoose stb minimp3 tflite-micro; fi
 for p in "$@"; do
     case $p in
         sqlite) sqlite ;;
         microdot) microdot ;;
         mongoose) mongoose ;;
         stb) stb ;;
+        minimp3) minimp3 ;;
         tflite-micro) tflite_micro ;;
         *) echo "unknown: $p" >&2; exit 2 ;;
     esac
