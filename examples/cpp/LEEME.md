@@ -1,26 +1,29 @@
 # C++ en la Waveshare ESP32-P4 (v2)
 
 Programas C++ (STL, excepciones, threads, sockets) para la placa. Se compilan
-en la Mac y se copian por SSH; la imagen no cambia (los programas son
-estáticos).
+en Linux (en Windows dentro de WSL2; en macOS `make` lo hace dentro de una VM
+Linux) y se copian por SSH; la imagen no cambia (los programas son
+estáticos).  Ver el README, **Tu computadora → Compilar los ejemplos**.
 
 ## Una sola vez: el compilador C++
 
-La imagen se compila sin C++. El compilador va en un directorio aparte de la
-VM, armado con la misma configuración (GCC 13.4, uClibc-ng, LinuxThreads,
-elf2flt), unos 6 minutos:
+La imagen se compila sin C++. El compilador va en un directorio aparte,
+armado con la misma configuración (GCC 13.4, uClibc-ng, LinuxThreads,
+elf2flt), unos 6 minutos.  Antes hay que haber compilado las imágenes
+(`docs/COMPILAR.md`), en el mismo Linux:
 
 ```bash
-orb -m rv32dev bash RUTA-AL-ARBOL-PARCHEADO/linux/waveshare/sdk/build-cxx-toolchain.sh   # ver docs/COMPILAR.md
+bash RUTA-AL-ARBOL-PARCHEADO/linux/waveshare/sdk/build-cxx-toolchain.sh           # Linux o WSL2
+orb -m rv32dev bash RUTA-AL-ARBOL-PARCHEADO/linux/waveshare/sdk/build-cxx-toolchain.sh   # macOS con OrbStack
 ```
 
-Queda en `~/ws-out/cxx-toolchain` dentro de la VM.
+Queda en `~/ws-out/cxx-toolchain` (en macOS, dentro de la VM).
 
-## Compilar, copiar y correr (desde la Mac)
+## Compilar, copiar y correr
 
 ```bash
 cd examples/cpp      # (en el árbol fuente: linux/waveshare/cxx-ejemplos)
-make            # compila (make se vuelve a ejecutar dentro de la VM)
+make            # compila (en macOS, make se vuelve a ejecutar dentro de la VM)
 make deploy     # copia a m5@stamp-p4.local:/home/m5/bin
 make run        # copia y corre stl-demo y threads-demo
 ```

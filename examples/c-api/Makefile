@@ -1,11 +1,11 @@
 # C programs with SQLite and Mongoose for the Waveshare ESP32-P4 v2 board.
 #
-# From the Mac (the compiler lives in the build VM; make re-runs itself there):
+# On Linux, WSL2 (Windows) or macOS (re-runs in the Linux VM): see ../host.mk
 #   sh ../terceros/descargar.sh sqlite mongoose     once: the sources
 #   make                 compile sqlite3, servidor-web and api-sqlite
 #   make deploy          copy them to the board (scp -O) into $(DESTINO)
 #   make clean
-# Variables: PLACA=stamp-p4.local USUARIO=m5 DESTINO=/home/m5/bin VM=rv32dev
+# Variables: PLACA=stamp-p4.local USUARIO=m5 DESTINO=/home/m5/bin (more in ../host.mk)
 #
 # These programs are bigger than the 496 KB the C++ examples aim for:
 # sqlite3 asks ~950 KB at exec, api-sqlite ~1.1 MB.  They start when the
@@ -14,28 +14,20 @@
 
 PROGS := sqlite3 servidor-web api-sqlite
 
-PLACA ?= stamp-p4.local
-USUARIO ?= m5
-DESTINO ?= /home/$(USUARIO)/bin
-VM ?= rv32dev
-SSH_OPTS ?= -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR
+include ../host.mk
 
 .PHONY: all clean deploy
 
-ifeq ($(shell uname -s),Darwin)
+ifeq ($(EN_VM),1)
 
 all:
-	orb -m $(VM) make -C "$(CURDIR)" all
+	$(call vm_rerun,all)
 
 clean:
-	orb -m $(VM) make -C "$(CURDIR)" clean
+	$(call vm_rerun,clean)
 
 else
 
-CXX_TOOLCHAIN ?= $(HOME)/ws-out/cxx-toolchain
-CROSS ?= $(CXX_TOOLCHAIN)/host/bin/riscv32-buildroot-linux-uclibc-
-CC := $(CROSS)gcc
-FLTHDR := $(CROSS)flthdr
 
 T := ../terceros
 SQLITE := $(T)/sqlite/src
@@ -92,5 +84,5 @@ endif
 
 deploy: all
 	ssh $(SSH_OPTS) $(USUARIO)@$(PLACA) 'mkdir -p $(DESTINO)'
-	scp -O $(SSH_OPTS) $(PROGS) $(USUARIO)@$(PLACA):$(DESTINO)/
+	$(SCP) $(SSH_OPTS) $(PROGS) $(USUARIO)@$(PLACA):$(DESTINO)/
 	@echo "copied to $(USUARIO)@$(PLACA):$(DESTINO): $(PROGS)"

@@ -6,7 +6,12 @@
 - **Cable:** USB-C de datos, conectado al puerto USB-C de la placa.  Es un
   adaptador USB-serie CH343:
   - en **macOS** aparece como `/dev/cu.usbmodemXXXX` (o `/dev/cu.wchusbserialXXXX`);
-  - en **Linux**, como `/dev/ttyACM0`.
+  - en **Linux**, como `/dev/ttyACM0`;
+  - en **Windows**, como un puerto `COM` (por ejemplo `COM3`): el número lo
+    muestra el Administrador de dispositivos, en "Puertos (COM y LPT)".
+    `flash.sh` corre en **Git Bash** (`./flash.sh COM3`); los comandos de
+    `esptool` de esta guía también andan en PowerShell.  No se probó en
+    Windows.
 
   Para encontrarlo:
   ```bash

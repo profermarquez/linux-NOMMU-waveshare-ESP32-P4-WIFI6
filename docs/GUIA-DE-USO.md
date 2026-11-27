@@ -249,12 +249,15 @@ Para cortarlo: `Ctrl+C`.
 `examples/c-sysinfo/sysinfo.c` muestra el nombre, el kernel y la RAM libre,
 y prueba reservar memoria.
 
+Se compila en Linux: en Windows dentro de WSL2, y en macOS `make` lo
+hace dentro de la VM Linux (README, **Tu computadora → Compilar los
+ejemplos**).
+
 ```bash
-# 1. compilar (con la toolchain de Buildroot, ver docs/COMPILAR.md)
-cd examples/c-sysinfo && make      # en la máquina Linux con la toolchain (docs/COMPILAR.md)
-# 2. copiar y ejecutar
-scp -O examples/c-sysinfo/sysinfo m5@<IP-de-la-placa>:/tmp/
-ssh m5@<IP-de-la-placa> '/tmp/sysinfo 2048; /tmp/sysinfo 4096'
+# 1. compilar y copiar a /home/m5/bin (el compilador: docs/COMPILAR.md)
+make -C examples/c-sysinfo deploy PLACA=<IP-de-la-placa>
+# 2. ejecutar
+ssh m5@<IP-de-la-placa> '/home/m5/bin/sysinfo 2048; /home/m5/bin/sysinfo 4096'
 ```
 
 ```
@@ -271,7 +274,7 @@ Reglas para compilar (ya están en el `Makefile`):
 |---|---|
 | `-Os -fPIC -Wl,-elf2flt=-r` | `-elf2flt` sin `=-r` compila pero el programa da *Segmentation fault* (faltan reubicaciones). |
 | `flthdr -s 65536 programa` | la pila por defecto (4 KB) no alcanza ni para `printf`. |
-| solo C, no C++ | la toolchain actual no incluye `g++`. |
+| C++ con otro compilador | el de las imágenes no trae `g++`: para C++ está `examples/cpp/` (11.5). |
 
 Para que un programa quede guardado después de reiniciar: copialo a
 `/boot/programs/` (como root) y corré `boot-save`.  Hay unos 150 KB libres.
@@ -786,7 +789,7 @@ Un navegador de texto escrito en MicroPython: `examples/micropython/navegador.py
 y el lanzador `examples/micropython/navegar`.  No es parte de la imagen.  Va
 en la microSD, en `/home/m5/bin`, así que no hace falta grabar la flash.
 
-**Instalar** (desde la Mac, en la carpeta del repositorio):
+**Instalar** (desde tu computadora, en la carpeta del repositorio):
 
 ```bash
 scp -O examples/micropython/navegador.py examples/micropython/navegar m5@stamp-p4.local:/home/m5/bin/
@@ -849,8 +852,10 @@ scp -O miprograma.py m5@stamp-p4.local:/home/m5/bin/     # subir
 scp -O m5@stamp-p4.local:/home/m5/bin/miprograma.py .    # bajar
 ```
 
-Sin `-O`, el `scp` de la Mac usa SFTP y falla con
-`can't execute '/usr/libexec/sftp-server'` y `Connection closed`.
+Sin `-O`, un `scp` de OpenSSH 9 o posterior (macOS, Linux y Windows 11
+actuales) usa SFTP y falla con `can't execute '/usr/libexec/sftp-server'`
+y `Connection closed`.  Un `scp` viejo que no conoce `-O` (OpenSSH 8.1
+de algunos Windows 10) funciona sin esa opción.
 
 **2. Editar en la placa con `vi`** (el de BusyBox):
 
@@ -949,13 +954,14 @@ baja y verifica su SHA-256.
 | stb_image | 2.34 (commit `6b5799b`) | dominio público o MIT |
 | TensorFlow Lite Micro | commit `38a8f0f` | Apache-2.0 |
 
-#### Instalar (desde la Mac, en la carpeta del repositorio)
+#### Instalar (desde tu computadora, en la carpeta del repositorio)
 
-Hace falta la VM de compilación con el compilador C++ (ver
+Hace falta un Linux con el compilador C++: Linux, WSL2 en Windows, o la
+VM en macOS (README, **Tu computadora → Compilar los ejemplos**;
 `examples/cpp/LEEME.md` y `docs/COMPILAR.md`).
 
 ```bash
-orb -m rv32dev sh examples/terceros/descargar.sh     # una vez, ~45 MB
+sh examples/terceros/descargar.sh                    # una vez, ~45 MB
 make -C examples/c-api deploy PLACA=stamp-p4.local   # sqlite3, servidor-web, api-sqlite
 make -C examples/tflm deploy PLACA=stamp-p4.local    # tflm-seno y los modelos .tflite
 ssh m5@stamp-p4.local 'mkdir -p /home/m5/.micropython/lib/microdot'
@@ -1162,7 +1168,7 @@ El modelo float tarda ~155 µs por inferencia, con error máximo 0,039.
 - dice qué dígito es, con la probabilidad de cada uno.
 
 ```bash
-make -C examples/tflm deploy PLACA=stamp-p4.local    # desde la Mac; copia también los dígitos de ejemplo
+make -C examples/tflm deploy PLACA=stamp-p4.local    # desde tu computadora; copia también los dígitos de ejemplo
 ```
 
 ```sh
@@ -1207,7 +1213,7 @@ caracteres en la terminal SSH.  Lee PNG, JPEG, BMP, GIF (el primer cuadro),
 TGA y PGM/PPM, con stb_image.
 
 ```bash
-make -C examples/ver-imagen deploy PLACA=stamp-p4.local       # desde la Mac
+make -C examples/ver-imagen deploy PLACA=stamp-p4.local       # desde tu computadora
 scp -O foto.jpg m5@stamp-p4.local:/home/m5/imagenes/           # subir imágenes
 ```
 
@@ -1224,8 +1230,8 @@ ver-imagen -n /home/m5/imagenes/*.png               # solo tamaño y canales
 | `ascii` | `" .:-=+*#%@"` según el brillo | cualquiera |
 | `bloques` | `░▒▓█` | UTF-8 |
 | `gris` | medio bloque `▀` con 24 grises (2 píxeles por carácter) | 256 colores |
-| `256` (por defecto) | medio bloque con la paleta de 256 colores | Terminal de la Mac, iTerm |
-| `color` | medio bloque en color de 24 bits | iTerm y la mayoría de las modernas |
+| `256` (por defecto) | medio bloque con la paleta de 256 colores | casi todas: Terminal de macOS, iTerm, Windows Terminal, GNOME Terminal |
+| `color` | medio bloque en color de 24 bits | iTerm, Windows Terminal, GNOME Terminal y la mayoría de las modernas |
 
 - `-w` fija el ancho en columnas.  Por defecto entra en 80 (o
   `$COLUMNS`), y las imágenes chicas, como los dígitos MNIST de 28×28, se
@@ -1294,7 +1300,7 @@ Un micrófono que no funciona da valores cerca de 0 o fijos.
 #### Grabar (`grabar`)
 
 ```bash
-make -C examples/audio deploy PLACA=stamp-p4.local      # desde la Mac
+make -C examples/audio deploy PLACA=stamp-p4.local      # desde tu computadora
 ```
 
 ```sh
@@ -1304,7 +1310,7 @@ grabar -e -s 5 estereo.wav        # los dos canales (el derecho repite el izquie
 ```
 
 ```bash
-scp -O m5@stamp-p4.local:/home/m5/voz.wav . && afplay voz.wav   # escucharlo en la Mac
+scp -O m5@stamp-p4.local:/home/m5/voz.wav .   # y escucharlo: aplay voz.wav (Linux), afplay (macOS), start voz.wav (Windows)
 ```
 
 Probado en la placa:
@@ -1370,7 +1376,7 @@ contra los cortes de la red.  Viene configurada con **RFI Monde**
 (`http://rfimonde64k.ice.infomaniak.ch/rfimonde-64.mp3`, 64 kbps).
 
 ```bash
-make -C examples/audio deploy PLACA=stamp-p4.local    # desde la Mac: instala radio y radio-rfi.sh
+make -C examples/audio deploy PLACA=stamp-p4.local    # desde tu computadora: instala radio y radio-rfi.sh
 ```
 
 Como `root`, al volumen más alto sin distorsión:

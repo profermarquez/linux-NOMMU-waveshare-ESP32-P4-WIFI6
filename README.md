@@ -58,14 +58,17 @@ Límites importantes:
   - Este paquete **no** graba el C6.
   - Si tu C6 tiene otro firmware, Linux arranca pero **no hay Wi-Fi**.
   - Ver `docs/INSTALAR.md` → "El firmware del ESP32-C6".
-- Python con `esptool` ≥ 5 (`pip install "esptool>=5"`).
+- Python con `esptool` ≥ 5 (`pip install "esptool>=5"`), en Linux,
+  Windows o macOS (ver **Tu computadora** más abajo).
 - El cable USB-C al puerto de la placa (adaptador USB-serie CH343).
 
 ## Instalación rápida
 
 ```bash
 pip install "esptool>=5"
-./flash.sh /dev/cu.usbmodemXXXX      # macOS  (o /dev/ttyACM0 en Linux)
+./flash.sh /dev/ttyACM0              # Linux
+./flash.sh /dev/cu.usbmodemXXXX      # macOS
+./flash.sh COM3                      # Windows, desde Git Bash
 ```
 
 Después, en la consola serie, ejecutá `wifi-connect` y escribí tu red.  Paso
@@ -85,7 +88,7 @@ a paso, backup y recuperación: **[docs/INSTALAR.md](docs/INSTALAR.md)**.
 | `CHANGELOG.md` | Qué cambió en la v2, qué está limitado y qué falló |
 | `source/0001-waveshare-esp32-p4-wifi6-v2.patch` | Los cambios respecto del proyecto base (aplicar sobre el commit `69a7312`) |
 | `source/0002-waveshare-audio.patch` | Micrófono y parlante: shim, driver `/dev/ws-audio` y DTB (aplicar después del 0001) |
-| `examples/` | Ejemplos: shell, MicroPython (cliente y servidor HTTP, mini navegador `navegador.py`), C (`c-hello`, `c-sysinfo`, `c-gpio`), C++ (`cpp/`), SQLite y visor web de tablas (`sqlite/`), servidor web y API REST en C con Mongoose (`c-api/`), visor de imágenes en la terminal (`ver-imagen/`), TensorFlow Lite Micro (`tflm/`: seno, dígitos, voz), grabador, reproductor y radio por internet (`audio/`), `wifi-ejemplo.txt`.  Guía 11.9–11.12 y la sección de abajo |
+| `examples/` | Ejemplos (cómo compilarlos en Linux, Windows o macOS: **Tu computadora**): shell, MicroPython (cliente y servidor HTTP, mini navegador `navegador.py`), C (`c-hello`, `c-sysinfo`, `c-gpio`), C++ (`cpp/`), SQLite y visor web de tablas (`sqlite/`), servidor web y API REST en C con Mongoose (`c-api/`), visor de imágenes en la terminal (`ver-imagen/`), TensorFlow Lite Micro (`tflm/`: seno, dígitos, voz), grabador, reproductor y radio por internet (`audio/`), `wifi-ejemplo.txt`.  Guía 11.9–11.12 y la sección de abajo |
 | `LICENSE` | GPL-2.0, la licencia del proyecto base |
 
 ## Imágenes
@@ -119,6 +122,93 @@ El DTB conserva el nombre del proyecto base, pero es el de esta placa
 | Wi-Fi (P4) | ESP-Hosted-MCU 3.0.10: módulo `esp_hosted_mcu.ko` + daemon `eh-wifi-sta` |
 | Wi-Fi (C6, requerido) | ESP-Hosted-MCU 3.0.10 (fw `0x0003000a`, RPC V2) |
 
+## Tu computadora: Linux, Windows o macOS
+
+Desde la computadora se hacen dos cosas:
+- **Hablar con la placa:** grabar la flash, abrir la consola serie, entrar
+  por SSH y pasar archivos.  Funciona en los tres sistemas.
+- **Compilar los ejemplos en C y C++:** hace falta **Linux**, porque el
+  compilador de la placa (riscv32, uClibc-ng, bFLT) es un programa de
+  Linux.  En Windows se usa WSL2 y en macOS una máquina virtual Linux.
+
+| | Linux | Windows 10/11 | macOS |
+|---|---|---|---|
+| Puerto de la placa | `/dev/ttyACM0` | `COM3` (el número lo muestra el Administrador de dispositivos) | `/dev/cu.usbmodemXXXX` |
+| Grabar el firmware | `./flash.sh /dev/ttyACM0` | `./flash.sh COM3` desde **Git Bash** | `./flash.sh /dev/cu.usbmodemXXXX` |
+| Consola serie (115200) | `python3 -m serial.tools.miniterm /dev/ttyACM0 115200` | `python -m serial.tools.miniterm COM3 115200`, o PuTTY | `python3 -m serial.tools.miniterm /dev/cu.usbmodemXXXX 115200` |
+| SSH y `scp -O` | vienen con el sistema (OpenSSH) | OpenSSH de Windows, en PowerShell; o dentro de WSL2 | vienen con el sistema |
+| `stamp-p4.local` | con `avahi-daemon` y `libnss-mdns` | sí desde Windows; **desde WSL2 no**: usá la IP | sí |
+| Compilar los ejemplos | directo | dentro de **WSL2** (Ubuntu) | dentro de una **VM Linux** (OrbStack u otra) |
+| Escuchar un WAV | `aplay voz.wav` | `start voz.wav` | `afplay voz.wav` |
+| Convertir audio a WAV de 16 kHz | `ffmpeg` | `ffmpeg` | `afconvert` (viene con macOS) o `ffmpeg` |
+| Achicar una imagen | ImageMagick (`magick`, o `convert` en la versión 6) | ImageMagick (`magick`) | `sips` (viene con macOS) o `magick` |
+| Abrir una base SQLite | `sqlite3`, DB Browser for SQLite | DB Browser for SQLite | `sqlite3` (viene con macOS), DB Browser |
+
+- `miniterm` viene con `pyserial`, que se instala junto con `esptool`.
+  Para salir: `Ctrl+]`.
+- **`scp -O`:** la placa no tiene `sftp-server`.
+  - Un OpenSSH 9 o posterior (macOS y Linux actuales, Windows 11 al día)
+    usa SFTP si no le pasás `-O`, y falla.
+  - Un OpenSSH viejo, por ejemplo el 8.1 de algunos Windows 10, no conoce
+    `-O`: ahí usá `scp` solo, y en los Makefiles `make deploy SCP=scp`.
+- **Estado de las pruebas:**
+  - todo se probó desde **macOS**, con la compilación en una VM Ubuntu
+    24.04 arm64 de OrbStack.  Los Makefiles corren en esa VM lo mismo que
+    corren en un Linux común;
+  - **Linux nativo y Windows no se probaron** con la placa.  Las
+    herramientas son las estándar de cada sistema.
+
+### Compilar los ejemplos
+
+1. **Un Linux para compilar** (x86_64 o arm64; se usó Ubuntu 24.04):
+   - **Linux:** tu propia máquina.
+   - **Windows:** instalá WSL2 con Ubuntu (`wsl --install -d Ubuntu`, en
+     PowerShell como administrador).  Cloná el repositorio **dentro de
+     WSL** (en `~/`, no en `/mnt/c/…`: ahí es lento y se pierden los
+     permisos).  Todos los comandos de abajo van en la terminal de Ubuntu.
+   - **macOS:** una VM Linux que vea la carpeta del repositorio **en la
+     misma ruta y con escritura**.  Con OrbStack, una máquina llamada
+     `rv32dev`.  Desde la Mac, `make` se vuelve a ejecutar solo dentro de
+     la VM.  Con otra VM: `make VM_RUN="limactl shell MAQUINA"` (Lima).
+     Para OrbStack con otro nombre: `make VM=nombre`.
+2. **El compilador de la placa, una sola vez, en ese Linux:**
+   - compilá las imágenes como explica [docs/COMPILAR.md](docs/COMPILAR.md).
+     Deja el compilador de C y libgpiod en `~/ws-out/buildroot`;
+   - para C++ y TensorFlow Lite Micro, agregá además el compilador C++,
+     unos 6 minutos (ver [examples/cpp/LEEME.md](examples/cpp/LEEME.md)).
+     Queda en `~/ws-out/cxx-toolchain`.  Si existe, los Makefiles lo usan
+     también para C.
+   - Si lo tenés en otra carpeta: `make CROSS=/ruta/bin/riscv32-buildroot-linux-uclibc-`.
+3. **Las fuentes de terceros**, una vez (SQLite, Mongoose, Microdot, stb,
+   minimp3, TensorFlow Lite Micro; ~45 MB, con SHA-256 verificado).  Hace
+   falta `curl`, `unzip`, `git` y `python3`, y para `tflm/` también `xxd`
+   (en Ubuntu: `sudo apt install curl unzip git python3 xxd`):
+   ```bash
+   sh examples/terceros/descargar.sh            # todas
+   sh examples/terceros/descargar.sh minimp3    # o una sola
+   ```
+4. **Compilar y copiar a la placa** (a `/home/m5/bin`, en la microSD):
+   ```bash
+   make -C examples/audio                                # compilar
+   make -C examples/audio deploy PLACA=stamp-p4.local    # compilar y copiar
+   make -C examples/audio deploy PLACA=192.168.1.50      # con la IP (WSL2, o sin mDNS)
+   ```
+   `deploy` pide la contraseña de `m5` si no instalaste tu clave SSH.  Las
+   variables están en [examples/host.mk](examples/host.mk).
+
+| Carpeta | Programas | Cómo se instala | Necesita |
+|---|---|---|---|
+| `shell/` | `estado.sh` | `scp -O` | nada |
+| `micropython/` | `navegar`, cliente y servidor HTTP | `scp -O` (guía, 11.9) | nada |
+| `sqlite/` | visor de tablas, API con Microdot | `scp -O` (guía, 11.11) | `descargar.sh microdot`, y `sqlite3` de `c-api/` |
+| `c-hello/`, `c-sysinfo/` | `hello`, `sysinfo` | `make deploy` | compilador de C |
+| `c-gpio/` | `gpio-parpadeo` (ya viene en la imagen) | `make deploy` | `~/ws-out/buildroot` (libgpiod) |
+| `cpp/` | `stl-demo`, `threads-demo`, `sockets-demo` | `make deploy` | compilador C++ |
+| `c-api/` | `sqlite3`, `servidor-web`, `api-sqlite` | `make deploy` | `descargar.sh sqlite mongoose` |
+| `ver-imagen/` | `ver-imagen` | `make deploy` | `descargar.sh stb` |
+| `tflm/` | `tflm-seno`, `tflm-mnist`, `tflm-voz` | `make deploy` | compilador C++, `descargar.sh tflite-micro stb` |
+| `audio/` | `grabar`, `reproducir`, `radio`, `radio-rfi.sh` | `make deploy` | `descargar.sh minimp3`, y el firmware de audio |
+
 ## Usar la placa: ubicaciones y ejemplos
 
 Lo que sigue se probó en la placa.  La guía completa está en
@@ -135,8 +225,9 @@ Lo que sigue se probó en la placa.  La guía completa está en
     such file or directory`.
   - Lo mismo pasa con `ssh m5@… 'comando'`: no carga el PATH, así que usá
     la ruta completa.
-- **Para pasar archivos, `scp -O`:** sin `-O` el `scp` de la Mac falla,
-  porque la placa no tiene `sftp-server`.
+- **Para pasar archivos, `scp -O`:** la placa no tiene `sftp-server`, y
+  sin `-O` los `scp` actuales fallan (ver **Tu computadora**).  En
+  Windows, `ssh` y `scp` andan igual desde PowerShell.
 - **No corras `df` sobre `/mnt/archivos`:** en una prueba colgó la placa
   y se reinició.  Sobre `/home/m5`, `df` funciona bien.
 
@@ -155,8 +246,8 @@ Lo que sigue se probó en la placa.  La guía completa está en
 | `/tmp`, `/root`, `/home` fuera de `m5` | RAM | **se borra al reiniciar** |
 
 Todo lo de `/home/m5` sobrevive a los reinicios.  Los programas se
-instalan desde la Mac con `make -C examples/<carpeta> deploy
-PLACA=stamp-p4.local`.
+instalan desde tu computadora con `make -C examples/<carpeta> deploy
+PLACA=stamp-p4.local` (ver **Compilar los ejemplos**).
 
 ### Bases de datos SQLite
 
@@ -171,11 +262,11 @@ micropython /home/m5/bin/ver_tablas.py /home/m5/lecturas.db  # visor web en http
 ```
 
 ```bash
-scp -O m5@stamp-p4.local:/home/m5/lecturas.db .              # copiarla a la Mac
+scp -O m5@stamp-p4.local:/home/m5/lecturas.db .              # copiarla a tu computadora
 ```
 
-- En la Mac se abre con `sqlite3`, que viene con macOS, o con DB Browser
-  for SQLite.
+- En la computadora se abre con `sqlite3` o con DB Browser for SQLite
+  (Linux, Windows y macOS).
 - `lecturas.db` la crea `api-sqlite` (la API en C).
 - `notas.db` la crea `api_microdot.py` (la API en MicroPython).
 - Las escrituras son lentas en la microSD: ~1 s cada una con
@@ -194,7 +285,11 @@ ver-imagen -m bloques -w 40 foto.jpg
 
 - Lee PNG, JPEG, BMP, GIF, TGA y PGM.
 - Una foto de más de 700 000 píxeles no entra en la RAM: achicala antes en
-  la Mac (`sips -Z 640 foto.jpg`).
+  la computadora, a 640 píxeles de lado como máximo:
+  ```bash
+  magick foto.jpg -resize 640x640 foto.jpg     # ImageMagick: Linux, Windows, macOS
+  sips -Z 640 foto.jpg                         # macOS, sin instalar nada
+  ```
 
 ### Reconocer un dígito escrito a mano (`tflm-mnist`)
 
@@ -205,10 +300,10 @@ tflm-mnist -q /home/m5/imagenes/sample?.png  # los 10 de ejemplo: los 10 bien
 
 Para probar con un dígito tuyo:
 1. Escribilo con fibra gruesa sobre papel blanco y sacale una foto.
-2. En la Mac, recortala para que el dígito ocupe casi todo el cuadro, y
-   achicala:
+2. En la computadora, recortala para que el dígito ocupe casi todo el
+   cuadro, achicala y copiala:
    ```bash
-   sips -Z 280 mi-digito.jpg
+   magick mi-digito.jpg -resize 280x280 mi-digito.jpg   # o en macOS: sips -Z 280 mi-digito.jpg
    scp -O mi-digito.jpg m5@stamp-p4.local:/home/m5/imagenes/
    ```
 3. En la placa:
@@ -233,7 +328,7 @@ Con ese firmware, al arrancar la consola serie muestra el nivel del
 micrófono (`ws_audio: mic L rms=…`).
 
 ```bash
-make -C examples/audio deploy PLACA=stamp-p4.local     # desde la Mac: instala grabar en /home/m5/bin
+make -C examples/audio deploy PLACA=stamp-p4.local     # desde tu computadora: instala grabar en /home/m5/bin
 ```
 
 ```sh
@@ -251,10 +346,13 @@ Salida real:
 /home/m5/voz.wav: 10.0 s de audio en 10.0 s, mono, 16 kHz, 16 bits
 ```
 
-Escucharlo en la Mac:
+Escucharlo en la computadora:
 
 ```bash
-scp -O m5@stamp-p4.local:/home/m5/voz.wav . && afplay voz.wav
+scp -O m5@stamp-p4.local:/home/m5/voz.wav .
+aplay voz.wav          # Linux
+afplay voz.wav         # macOS
+start voz.wav          # Windows (PowerShell)
 ```
 
 - **Guardá las grabaciones en `/home/m5`** (microSD).  En `/tmp` se
@@ -272,7 +370,7 @@ de la placa (MX1.25 de 2 pines, 8 Ω): rojo al `+`, negro al `−`, **con la
 placa apagada**.
 
 ```bash
-make -C examples/audio deploy PLACA=stamp-p4.local     # desde la Mac: instala grabar y reproducir
+make -C examples/audio deploy PLACA=stamp-p4.local     # desde tu computadora: instala grabar y reproducir
 ```
 
 ```sh
@@ -292,10 +390,11 @@ Salida real:
 - Lee WAV de 16 bits, mono o estéreo, de 4 a 48 kHz.  Si no es de 16 kHz
   lo convierte: suena a la velocidad correcta, con menos calidad.
 - `Ctrl+C` corta; el amplificador se apaga solo medio segundo después.
-- **Para pasar un audio de la Mac a la placa** (16 bits; `afconvert` viene
-  con macOS):
+- **Para pasar un audio de la computadora a la placa**, convertilo antes
+  a WAV de 16 bits, mono y 16 kHz:
   ```bash
-  afconvert -f WAVE -d LEI16@16000 -c 1 cancion.m4a cancion.wav
+  ffmpeg -i cancion.m4a -ac 1 -ar 16000 -c:a pcm_s16le cancion.wav   # Linux, Windows, macOS
+  afconvert -f WAVE -d LEI16@16000 -c 1 cancion.m4a cancion.wav      # macOS, sin instalar nada
   scp -O cancion.wav m5@stamp-p4.local:/home/m5/audio/
   ```
 - Igual que al grabar: **no copies archivos a la microSD mientras suena**,
@@ -311,7 +410,8 @@ contra los cortes de la red.  Viene configurada con **RFI Monde**
 (`http://rfimonde64k.ice.infomaniak.ch/rfimonde-64.mp3`, 64 kbps).
 
 ```bash
-make -C examples/audio deploy PLACA=stamp-p4.local    # desde la Mac: instala radio y radio-rfi.sh
+sh examples/terceros/descargar.sh minimp3             # una vez: el decodificador MP3
+make -C examples/audio deploy PLACA=stamp-p4.local    # desde tu computadora: instala radio y radio-rfi.sh
 ```
 
 Como `root`, al volumen más alto sin distorsión:
@@ -365,7 +465,7 @@ Salida real:
 ### Decir "yes" o "no" (`tflm-voz`)
 
 ```bash
-make -C examples/tflm deploy PLACA=stamp-p4.local    # instala tflm-voz y copia los WAV a /home/m5/audio
+make -C examples/tflm deploy PLACA=stamp-p4.local    # desde tu computadora: instala tflm-voz y copia los WAV a /home/m5/audio
 ```
 
 ```sh

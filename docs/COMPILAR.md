@@ -1,8 +1,14 @@
 # Compilar las imágenes desde el código fuente
 
-Las imágenes de `firmware/` se compilaron así.  Se necesita **Linux** (o una
-VM Linux; en la placa de prueba se usó Ubuntu 24.04 arm64 en OrbStack) y
-unos 20 GB libres.
+Las imágenes de `firmware/` se compilaron así.  Se necesita **Linux** y
+unos 20 GB libres:
+- **Linux:** directo (x86_64 o arm64);
+- **Windows:** dentro de WSL2 con Ubuntu, con el código en el disco de
+  WSL (`~/`), no en `/mnt/c`;
+- **macOS:** en una VM Linux.  Para las imágenes de `firmware/` se usó
+  Ubuntu 24.04 arm64 en OrbStack.
+
+Solo se probó en esa VM de OrbStack.
 
 ## 1. Código
 
@@ -84,8 +90,9 @@ SHA-256 van a ser distintos de los de `firmware/`.
 
 ## 5. Programas propios (bFLT)
 
-Ver `examples/` y la sección 4.3 de `GUIA-DE-USO.md`.  La toolchain queda en
-`$HOME/ws-out/buildroot/host/bin/`:
+Ver `examples/` (cada carpeta tiene su `Makefile`; README, **Tu computadora
+→ Compilar los ejemplos**) y la sección 4.3 de `GUIA-DE-USO.md`.  La
+toolchain queda en `$HOME/ws-out/buildroot/host/bin/`:
 
 ```bash
 riscv32-linux-gcc -Os -fPIC -Wl,-elf2flt=-r -o prog prog.c

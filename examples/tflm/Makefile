@@ -1,40 +1,31 @@
 # TensorFlow Lite for Microcontrollers for the Waveshare ESP32-P4 v2 board.
 #
-# From the Mac (the compiler lives in the build VM; make re-runs itself there):
+# On Linux, WSL2 (Windows) or macOS (re-runs in the Linux VM): see ../host.mk
 #   sh ../terceros/descargar.sh tflite-micro stb   once: sources
 #   make                 build libtflm.a, tflm-seno and tflm-mnist
 #   make deploy          copy both programs, the .tflite models and the
 #                        MNIST sample digits to the board
 #   make clean
-# Variables: PLACA=stamp-p4.local USUARIO=m5 DESTINO=/home/m5/bin VM=rv32dev
+# Variables: PLACA=stamp-p4.local USUARIO=m5 DESTINO=/home/m5/bin (more in ../host.mk)
 #
 # The library is built once into build/libtflm.a (a few minutes); a program
 # only links the operators it registers.
 
-PLACA ?= stamp-p4.local
-USUARIO ?= m5
-DESTINO ?= /home/$(USUARIO)/bin
-VM ?= rv32dev
-SSH_OPTS ?= -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR
+NEED_CXX := 1
+include ../host.mk
 
 .PHONY: all clean deploy
 
-ifeq ($(shell uname -s),Darwin)
+ifeq ($(EN_VM),1)
 
 all:
-	orb -m $(VM) make -C "$(CURDIR)" -j4 all
+	$(call vm_rerun,-j4 all)
 
 clean:
-	orb -m $(VM) make -C "$(CURDIR)" clean
+	$(call vm_rerun,clean)
 
 else
 
-CXX_TOOLCHAIN ?= $(HOME)/ws-out/cxx-toolchain
-CROSS ?= $(CXX_TOOLCHAIN)/host/bin/riscv32-buildroot-linux-uclibc-
-CXX := $(CROSS)g++
-CC := $(CROSS)gcc
-AR := $(CROSS)ar
-FLTHDR := $(CROSS)flthdr
 
 TREE ?= ../terceros/tflm-tree
 MODELS ?= ../terceros/tflite-micro/tensorflow/lite/micro/examples/hello_world/models
@@ -131,9 +122,9 @@ endif
 
 deploy: all
 	ssh $(SSH_OPTS) $(USUARIO)@$(PLACA) 'mkdir -p $(DESTINO) /home/$(USUARIO)/modelos /home/$(USUARIO)/imagenes'
-	scp -O $(SSH_OPTS) tflm-seno tflm-mnist tflm-voz $(USUARIO)@$(PLACA):$(DESTINO)/
+	$(SCP) $(SSH_OPTS) tflm-seno tflm-mnist tflm-voz $(USUARIO)@$(PLACA):$(DESTINO)/
 	ssh $(SSH_OPTS) $(USUARIO)@$(PLACA) 'mkdir -p /home/$(USUARIO)/audio'
-	scp -O $(SSH_OPTS) ../terceros/tflite-micro/tensorflow/lite/micro/examples/micro_speech/testdata/*_1000ms.wav $(USUARIO)@$(PLACA):/home/$(USUARIO)/audio/
-	scp -O $(SSH_OPTS) ../terceros/tflite-micro/tensorflow/lite/micro/examples/hello_world/models/*.tflite $(USUARIO)@$(PLACA):/home/$(USUARIO)/modelos/
-	scp -O $(SSH_OPTS) ../terceros/tflite-micro/tensorflow/lite/micro/examples/mnist_lstm/samples/*.png $(USUARIO)@$(PLACA):/home/$(USUARIO)/imagenes/
+	$(SCP) $(SSH_OPTS) ../terceros/tflite-micro/tensorflow/lite/micro/examples/micro_speech/testdata/*_1000ms.wav $(USUARIO)@$(PLACA):/home/$(USUARIO)/audio/
+	$(SCP) $(SSH_OPTS) ../terceros/tflite-micro/tensorflow/lite/micro/examples/hello_world/models/*.tflite $(USUARIO)@$(PLACA):/home/$(USUARIO)/modelos/
+	$(SCP) $(SSH_OPTS) ../terceros/tflite-micro/tensorflow/lite/micro/examples/mnist_lstm/samples/*.png $(USUARIO)@$(PLACA):/home/$(USUARIO)/imagenes/
 	@echo "copied tflm-seno and tflm-mnist to $(DESTINO), the models to /home/$(USUARIO)/modelos, the digits to /home/$(USUARIO)/imagenes"

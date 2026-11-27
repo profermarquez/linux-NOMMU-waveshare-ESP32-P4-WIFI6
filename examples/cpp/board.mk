@@ -19,6 +19,7 @@
 #                    ~543 KB: it only starts when a 1 MB block is free.  Use
 #                    <cstdio> (printf) instead.
 
+# The C++ toolchain (examples/cpp/LEEME.md).  ../host.mk sets these too.
 CXX_TOOLCHAIN ?= $(HOME)/ws-out/cxx-toolchain
 CROSS ?= $(CXX_TOOLCHAIN)/host/bin/riscv32-buildroot-linux-uclibc-
 CXX := $(CROSS)g++
@@ -46,7 +47,7 @@ $(B):
 	mkdir -p $@
 
 $(B)/string-inst.o: | $(B)
-	@test -x "$(CXX)" || { echo "no C++ compiler at $(CXX): run sdk/build-cxx-toolchain.sh" >&2; exit 1; }
+	@test -x "$(CXX)" || { echo "no C++ compiler at $(CXX): see examples/cpp/LEEME.md (sdk/build-cxx-toolchain.sh)" >&2; exit 1; }
 	cd $(B) && $(AR) x "$$($(CXX) -print-file-name=libstdc++.a)" string-inst.o
 
 $(B)/nommu-cxx.o: $(BOARD_MK_DIR)nommu-cxx.c | $(B)

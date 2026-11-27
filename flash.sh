@@ -2,6 +2,7 @@
 # Graba Linux NOMMU en el ESP32-P4 de una Waveshare ESP32-P4-WIFI6.
 #
 #   ./flash.sh PUERTO            ej.: ./flash.sh /dev/cu.usbmodem1101   (macOS)
+#                                     ./flash.sh COM3                   (Windows, Git Bash)
 #                                     ./flash.sh /dev/ttyACM0           (Linux)
 #
 # Requiere esptool >= 5.0 (pip install "esptool>=5").  Solo escribe la flash del
