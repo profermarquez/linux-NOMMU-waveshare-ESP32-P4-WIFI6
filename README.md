@@ -2,8 +2,8 @@
 
 > **Rama v2.**  Suma a la v1 microSD, NTP/zona horaria, varias redes Wi-Fi y
 > punto de acceso, HTTPS, C++, GPIO, I2C y SPI.  Después se agregaron
-> programas en la microSD (SQLite, web, IA), el micrófono y el parlante: ver
-> **Usar la placa** más abajo.  Detalle y límites:
+> programas en la microSD (SQLite, web, IA), el micrófono, el parlante y
+> Bluetooth (BLE): ver **Usar la placa** más abajo.  Detalle y límites:
 > **[CHANGELOG.md](CHANGELOG.md)**.  La v1 sigue en la rama `main`
 > ([docs/VOLVER-A-V1.md](docs/VOLVER-A-V1.md)).
 
@@ -38,6 +38,8 @@ v0.5.1 (perfil `m3-lab`), adaptado a esta placa.
 | SQLite, servidor web, APIs REST, TensorFlow Lite Micro (en la microSD) | ✅ |
 | Micrófono (`grabar`, `tflm-voz`) | ✅ con el firmware de audio (no está en `firmware/`) |
 | Parlante en el conector SPK (`reproducir`, `radio`) | ✅ con el firmware de audio |
+| Bluetooth LE: escanear (`ble_scan`), anunciar (`ble_adv`), servidor para el celular (`ble-ap`, `ble-server`) | ✅ con el firmware de Bluetooth y el C6 actualizado (no está en `firmware/`) |
+| Bluetooth clásico: parlante Bluetooth (A2DP), puerto serie (SPP) | ❌ el C6 no lo tiene |
 | Temperatura del chip | ⏸️ en pausa |
 | IPv6, USB OTG, segundo núcleo | ❌ |
 
@@ -88,7 +90,10 @@ a paso, backup y recuperación: **[docs/INSTALAR.md](docs/INSTALAR.md)**.
 | `CHANGELOG.md` | Qué cambió en la v2, qué está limitado y qué falló |
 | `source/0001-waveshare-esp32-p4-wifi6-v2.patch` | Los cambios respecto del proyecto base (aplicar sobre el commit `69a7312`) |
 | `source/0002-waveshare-audio.patch` | Micrófono y parlante: shim, driver `/dev/ws-audio` y DTB (aplicar después del 0001) |
-| `examples/` | Ejemplos (cómo compilarlos en Linux, Windows o macOS: **Tu computadora**): shell, MicroPython (cliente y servidor HTTP, mini navegador `navegador.py`), C (`c-hello`, `c-sysinfo`, `c-gpio`), C++ (`cpp/`), SQLite y visor web de tablas (`sqlite/`), servidor web y API REST en C con Mongoose (`c-api/`), visor de imágenes en la terminal (`ver-imagen/`), TensorFlow Lite Micro (`tflm/`: seno, dígitos, voz), grabador, reproductor y radio por internet (`audio/`), `wifi-ejemplo.txt`.  Guía 11.9–11.12 y la sección de abajo |
+| `source/0003-waveshare-bluetooth.patch` | Bluetooth LE: kernel, `hci0` a pedido, `eh-wifid` (actualizar el C6, `bt-on`), herramientas BLE y el reintento del enlace con el C6 al arrancar (aplicar después del 0002) |
+| `firmware/c6-ble/` | Firmware del C6 con Wi-Fi + BLE (`eh_cp_wifi_sta-bt1.bin`) y el `otadata` para volver al de fábrica.  Se graba desde Linux, sin cables |
+| `source/c6-ble-sdkconfig` | La configuración con la que se compiló ese firmware del C6 |
+| `examples/` | Ejemplos (cómo compilarlos en Linux, Windows o macOS: **Tu computadora**): shell, MicroPython (cliente y servidor HTTP, mini navegador `navegador.py`), C (`c-hello`, `c-sysinfo`, `c-gpio`), C++ (`cpp/`), SQLite y visor web de tablas (`sqlite/`), servidor web y API REST en C con Mongoose (`c-api/`), visor de imágenes en la terminal (`ver-imagen/`), TensorFlow Lite Micro (`tflm/`: seno, dígitos, voz), grabador, reproductor y radio por internet (`audio/`), `wifi-ejemplo.txt`.  Guía 11.9–11.13 y la sección de abajo |
 | `LICENSE` | GPL-2.0, la licencia del proyecto base |
 
 ## Imágenes
@@ -121,6 +126,7 @@ El DTB conserva el nombre del proyecto base, pero es el de esta placa
 | Boot shim / bootloader | ESP-IDF v5.5.3 |
 | Wi-Fi (P4) | ESP-Hosted-MCU 3.0.10: módulo `esp_hosted_mcu.ko` + daemon `eh-wifi-sta` |
 | Wi-Fi (C6, requerido) | ESP-Hosted-MCU 3.0.10 (fw `0x0003000a`, RPC V2) |
+| Bluetooth (C6, opcional) | el mismo, compilado con BLE: `v3.0.10-25-g1efaa56f-bt1`, ESP-IDF v5.5.5 |
 
 ## Tu computadora: Linux, Windows o macOS
 
@@ -212,7 +218,7 @@ Desde la computadora se hacen dos cosas:
 ## Usar la placa: ubicaciones y ejemplos
 
 Lo que sigue se probó en la placa.  La guía completa está en
-[docs/GUIA-DE-USO.md](docs/GUIA-DE-USO.md), secciones 11.9 a 11.12.
+[docs/GUIA-DE-USO.md](docs/GUIA-DE-USO.md), secciones 11.9 a 11.13.
 
 ### Antes de empezar
 
@@ -480,6 +486,91 @@ tflm-voz -m -v                   # escuchar el micrófono en vivo; Ctrl+C para s
 - Solo conoce "yes" y "no", en inglés.
 - **Todavía no probé** que reconozca una voz real hablándole a la placa.
 
+### Bluetooth (BLE): `ble_scan`, `ble-ap`, `ble-server`
+
+El ESP32-C6 de la placa también tiene **Bluetooth LE** (Low Energy).  Hace
+falta:
+- el **firmware de Bluetooth** del P4: el kernel con `CONFIG_BT` y el
+  rootfs con las herramientas, además del firmware de audio;
+  - las fuentes están en `source/0003-waveshare-bluetooth.patch`;
+  - **las imágenes de `firmware/` de este repositorio todavía no lo traen**
+    (ver la guía, 11.13);
+- y **actualizar el C6** con `firmware/c6-ble/`.  Se hace desde Linux, sin
+  cables ni jumpers:
+
+```bash
+scp -O firmware/c6-ble/eh_cp_wifi_sta-bt1.bin root@stamp-p4.local:/tmp/    # desde tu computadora
+```
+
+```sh
+eh-wifictl c6-info                                 # qué tiene el C6 ahora
+eh-wifictl c6-ota /tmp/eh_cp_wifi_sta-bt1.bin      # lo escribe en la ranura libre y lo verifica (~21 s)
+eh-wifictl c6-activate                             # el C6 arranca el nuevo y se reinicia solo
+reboot
+```
+
+Después del reinicio, `dmesg | grep capabilities` tiene que decir `0xd`
+(Wi-Fi + BLE).  El Wi-Fi sigue igual: la configuración de coexistencia es
+la del ejemplo de Espressif para Wi-Fi + BLE.
+
+**Ver los dispositivos BLE de alrededor:**
+
+```sh
+ble_scan            # escanea 20 s
+```
+
+Salida real (recortada):
+
+```
+ADV 12:9d:e1:d3:84:d6 type=03 at=01 rssi=-57 adlen=31
+ble_scan: LE Set Scan Disable cmd_complete op=0x200c status=0x00
+ble_scan: total events=283 advertising_reports=283
+```
+
+**Que el celular se conecte a la placa:**
+
+```sh
+ble-ap                  # queda en segundo plano, con el nombre de la placa
+ble-ap MiPlaca          # o con otro nombre (hasta 29 letras)
+ble-ap status           # si está corriendo, y lo último del log (/run/ble-ap.log)
+ble-ap stop
+ble-server              # lo mismo, pero en primer plano: lo que escribís va al celular
+```
+
+En el celular, con **nRF Connect** (Android o iPhone):
+1. Escaneá y conectate a la placa.  Si pregunta si emparejar, aceptá: no
+   pide PIN.
+2. Abrí **Nordic UART Service**.
+3. En **TX** (`6E400003…`) activá las notificaciones.
+4. En **RX** (`6E400002…`) escribí `info`.  La respuesta llega por TX.
+
+Las apps de "terminal serie BLE" que conocen el Nordic UART Service
+también sirven.  Respuestas reales (probado con un cliente en la Mac):
+
+```
+write: info                 notify: P4-test: Linux 7.2.11
+write: uptime               notify: uptime 83 s
+write: hola desde el Mac    notify: echo: hola desde el Mac
+```
+
+- `info` y `uptime` tienen respuesta; lo demás vuelve como `echo: …`.
+  **Lo que manda el celular nunca se ejecuta** en la placa.
+- También muestra **Device Information**: fabricante `Waveshare`, modelo
+  `ESP32-P4-WIFI6 Linux`.
+- **Un celular por vez.**  Cuando se desconecta, la placa vuelve a anunciarse.
+- **Emparejamiento "Just Works":** el enlace va cifrado, pero sin PIN
+  cualquiera cerca se puede conectar.  No mandes contraseñas por ahí.
+- Las herramientas BLE no pueden correr dos a la vez: pará `ble-ap` antes
+  de `ble_scan`.
+- **No hay parlante Bluetooth.**  El celular manda música por Bluetooth
+  clásico (A2DP) o por LE Audio, y el C6 no tiene ninguno de los dos.  Para
+  eso haría falta otro chip, por ejemplo un ESP32 original.
+- **No pongas un jumper en `C6_IO9`.**  Con ese pin a masa, el C6 arranca
+  en modo de programación y no hay Wi-Fi ni Bluetooth.
+- **Volver al C6 de fábrica:** `ota_0` no se toca al actualizar.  Basta
+  grabar `firmware/c6-ble/otadata-ota0.bin` en `0xd000` del C6 con un
+  adaptador USB-serie en sus pads (ver la guía, 11.13).
+
 ## Créditos y licencia
 
 - Proyecto base:
@@ -487,7 +578,9 @@ tflm-voz -m -v                   # escuchar el micrófono en vivo; Ctrl+C para s
   GPL-2.0.  Este port se distribuye con la misma licencia (`LICENSE`).
 - ESP-Hosted-MCU:
   [espressif/esp-hosted-mcu](https://github.com/espressif/esp-hosted-mcu),
-  Apache-2.0.
+  Apache-2.0.  `firmware/c6-ble/` es su ejemplo `eh_cp_wifi_sta` compilado
+  con Bluetooth, sin cambios en el código.
+- `ble_scan`, `ble_adv` y `hci_up` vienen de linux-waveshare-xc (GPL-2.0).
 - Linux, BusyBox, uClibc-ng, Dropbear y MicroPython: cada uno con su
   licencia.
 

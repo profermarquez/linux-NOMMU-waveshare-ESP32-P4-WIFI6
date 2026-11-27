@@ -1,5 +1,43 @@
 # Cambios
 
+## Bluetooth LE (2026-11-27, sobre la v2 con audio)
+
+Fuentes: `source/0003-waveshare-bluetooth.patch` (después del 0002).
+Firmware del C6: `firmware/c6-ble/`.  Las imágenes de `firmware/` **no**
+lo traen.  Detalle: guía, 11.13.
+
+### Nuevo
+
+| Qué | Estado |
+|---|---|
+| Kernel con `CONFIG_BT=y`, solo LE; `hci0` se registra cuando una herramienta lo pide | ✅ |
+| Firmware del C6 con BLE (`eh_cp_wifi_sta` 3.0.10 de Espressif, solo 4 opciones distintas), grabado **desde Linux**: `eh-wifictl c6-info`, `c6-ota`, `c6-activate` | ✅ |
+| `ble_scan` (escanear), `ble_adv` (anunciar) | ✅ 15 dispositivos en 20 s, con el Wi-Fi andando |
+| `ble-ap` / `ble-server`: servidor GATT para el celular (Nordic UART + Device Information), emparejamiento "Just Works" | ✅ con Android (conecta y empareja) y con la Mac (servicios, lectura, notificaciones, respuestas) |
+| `S40network`: si el C6 no contesta por SDIO al arrancar, reinicia (hasta 2 veces seguidas) | ✅ 10 de 10 reinicios con Wi-Fi |
+
+### Limitaciones conocidas
+
+- **Solo BLE.**  El C6 no tiene Bluetooth clásico ni LE Audio: no puede ser
+  un parlante Bluetooth (A2DP) ni un puerto serie clásico (SPP).
+- Un celular por vez y una herramienta BLE por vez.
+- "Just Works" no tiene PIN: el enlace va cifrado, pero cualquiera cerca se
+  puede conectar.
+- Alrededor de 1 de cada 9 `reboot` el enlace SDIO con el C6 falla al
+  arrancar (ya pasaba antes del BLE).  El reintento lo esquiva; la causa
+  sigue sin encontrarse.
+- Volver al firmware de fábrica del C6 necesita un adaptador USB-serie en
+  sus pads (grabar `otadata-ota0.bin` en `0xd000`).
+- `C6_IO9` a masa (jumper) deja al C6 en modo de programación: sin Wi-Fi ni
+  Bluetooth.
+
+### Imágenes del C6
+
+| Archivo | SHA-256 |
+|---|---|
+| `firmware/c6-ble/eh_cp_wifi_sta-bt1.bin` (ranura `ota_1`) | `cfc45bef26bee032a5c5134269367bd5c1e52ba0b68a8d47addfe3c4d4a88ac8` |
+| `firmware/c6-ble/otadata-ota0.bin` (`0xd000`, vuelve a `ota_0`) | `8ba3b110139f45443d4f268d1a3373ef99a1718b71d51664531b83ee2d4b91a3` |
+
 ## v2 "mejorado" (rama `linux-NOMMU-waveshare-ESP32-P4-WIFI6-mejorado`, 2026-11-23)
 
 Probada en la misma placa que la v1 (ESP32-P4 rev v3.2, 32 MB de flash y

@@ -1,0 +1,2652 @@
+Bluetooth (BLE) de la Waveshare ESP32-P4-WIFI6 sobre la v2 con audio.
+
+Aplicar despues de 0001-waveshare-esp32-p4-wifi6-v2.patch y 0002-waveshare-audio.patch.
+Necesita el firmware del C6 con BLE (firmware/c6-ble/, se graba desde Linux con
+eh-wifictl c6-ota): con el firmware de estacion de fabrica no aparece hci0.
+- kernel: CONFIG_BT=y, solo LE (linux/waveshare/kernel-bt.config.fragment)
+- esp_hosted_mcu: hci0 a pedido (parametro bt_enable)
+- eh-wifid: c6-info, c6-ota, c6-activate, bt-on, bt-off
+- ble-tools: ble_scan, ble_adv, hci_up, ble_server (GATT, Nordic UART), ble-ap, ble-server
+- S40network: si el C6 no contesta por SDIO al arrancar, reinicia (hasta 2 veces)
+Commits: cdf8d47 7768ccd 82317b6 fbfdf22
+
+diff --git a/linux/build-m1.sh b/linux/build-m1.sh
+index 0522104..3b72b33 100755
+--- a/linux/build-m1.sh
++++ b/linux/build-m1.sh
+@@ -1208,6 +1208,9 @@ if [[ "${BOARD:-}" == waveshare ]]; then
+ 	if [[ "${WS_AUDIO:-1}" != "0" ]]; then
+ 		printf '%s\n' "CONFIG_ESP32P4_WS_AUDIO=y" >>"${kernel_config_fragment}"
+ 	fi
++	if [[ "${WS_BT:-1}" != "0" ]]; then
++		cat "${firmware_root}/linux/waveshare/kernel-bt.config.fragment" >>"${kernel_config_fragment}"
++	fi
+ fi
+ if [[ -n "$pstore_identity" ]]; then
+ 	cat >>"${kernel_config_fragment}" <<'EOF'
+@@ -1334,10 +1337,14 @@ if $network_profile; then
+ 			exit 2
+ 		}
+ 		make_args+=(ESP_HOSTED_MCU_SITE="${ws_vendor}")
++		if [[ "${WS_BT:-1}" == "0" ]]; then
++			make_args+=(ESP_HOSTED_MCU_BT=n)
++		fi
+ 		make_args+=(EH_WIFI_STA_SITE="${ws_vendor}")
+ 		make_args+=(EH_WIFI_STA_APP_SRC="${firmware_root}/linux/waveshare/eh-wifi-sta")
+ 		make_args+=(HTTPS_GET_SITE="${firmware_root}/linux/waveshare/https-get")
+ 		make_args+=(GPIO_EJEMPLO_SITE="${firmware_root}/linux/waveshare/gpio-ejemplo")
++		make_args+=(BLE_TOOLS_SITE="${firmware_root}/linux/waveshare/ble-tools")
+ 	fi
+ fi
+ 
+@@ -2359,6 +2366,12 @@ if [[ "${BOARD:-}" == waveshare ]]; then
+ 	# v2 I2C/SPI (phase 9): i2cdetect/i2cget/i2cset/i2cdump and spidev_test.
+ 	set_config_value "${br_output}/.config" BR2_PACKAGE_I2C_TOOLS y
+ 	set_config_value "${br_output}/.config" BR2_PACKAGE_SPIDEV_TEST y
++	# BLE (WS_BT=1, default): hci_up, ble_scan, ble_adv.
++	if [[ "${WS_BT:-1}" != "0" ]]; then
++		set_config_value "${br_output}/.config" BR2_PACKAGE_BLE_TOOLS y
++	else
++		set_config_value "${br_output}/.config" BR2_PACKAGE_BLE_TOOLS "# BR2_PACKAGE_BLE_TOOLS is not set"
++	fi
+ 	rootfs_overlay="${rootfs_overlay} ${firmware_root}/linux/waveshare/rootfs-overlay"
+ 	post_build_scripts="${post_build_scripts} ${firmware_root}/linux/waveshare/post-build.sh"
+ 	busybox_fragments="${busybox_fragments:+${busybox_fragments} }${firmware_root}/linux/waveshare/busybox.fragment"
+@@ -2367,6 +2380,7 @@ else
+ 	set_config_value "${br_output}/.config" BR2_PACKAGE_EH_WIFI_STA "# BR2_PACKAGE_EH_WIFI_STA is not set"
+ 	set_config_value "${br_output}/.config" BR2_PACKAGE_HTTPS_GET "# BR2_PACKAGE_HTTPS_GET is not set"
+ 	set_config_value "${br_output}/.config" BR2_PACKAGE_GPIO_EJEMPLO "# BR2_PACKAGE_GPIO_EJEMPLO is not set"
++	set_config_value "${br_output}/.config" BR2_PACKAGE_BLE_TOOLS "# BR2_PACKAGE_BLE_TOOLS is not set"
+ fi
+ set_config_value "${br_output}/.config" BR2_ROOTFS_OVERLAY "\"${rootfs_overlay}\""
+ set_config_value "${br_output}/.config" BR2_ROOTFS_POST_BUILD_SCRIPT "\"${post_build_scripts}\""
+@@ -2408,6 +2422,7 @@ if $network_profile; then
+ 	if [[ "${BOARD:-}" == waveshare ]]; then
+ 		make "${make_args[@]}" esp-hosted-mcu-dirclean
+ 		make "${make_args[@]}" eh-wifi-sta-dirclean
++		make "${make_args[@]}" ble-tools-dirclean
+ 	fi
+ 	make "${make_args[@]}" wpa_supplicant-dirclean
+ 	make "${make_args[@]}" busybox-dirclean
+diff --git a/linux/buildroot-external/Config.in b/linux/buildroot-external/Config.in
+index 8cf2660..3e5ead0 100644
+--- a/linux/buildroot-external/Config.in
++++ b/linux/buildroot-external/Config.in
+@@ -5,6 +5,7 @@ source "$BR2_EXTERNAL_STAMP_P4_PATH/package/esp-hosted-mcu/Config.in"
+ source "$BR2_EXTERNAL_STAMP_P4_PATH/package/eh-wifi-sta/Config.in"
+ source "$BR2_EXTERNAL_STAMP_P4_PATH/package/https-get/Config.in"
+ source "$BR2_EXTERNAL_STAMP_P4_PATH/package/gpio-ejemplo/Config.in"
++source "$BR2_EXTERNAL_STAMP_P4_PATH/package/ble-tools/Config.in"
+ source "$BR2_EXTERNAL_STAMP_P4_PATH/package/m5stamp-smp-smoke/Config.in"
+ source "$BR2_EXTERNAL_STAMP_P4_PATH/package/m5stamp-smp-stress/Config.in"
+ source "$BR2_EXTERNAL_STAMP_P4_PATH/package/micropython-nommu/Config.in"
+diff --git a/linux/buildroot-external/package/ble-tools/Config.in b/linux/buildroot-external/package/ble-tools/Config.in
+new file mode 100644
+index 0000000..985c8c1
+--- /dev/null
++++ b/linux/buildroot-external/package/ble-tools/Config.in
+@@ -0,0 +1,5 @@
++config BR2_PACKAGE_BLE_TOOLS
++	bool "ble-tools (hci_up, ble_scan, ble_adv over HCI_CHANNEL_USER)"
++	help
++	  Minimal BLE tools for the Waveshare ESP32-P4-WIFI6 (no BlueZ, which
++	  needs an MMU).  Taken from linux-waveshare-xc, GPL-2.0-only.
+diff --git a/linux/buildroot-external/package/ble-tools/ble-tools.mk b/linux/buildroot-external/package/ble-tools/ble-tools.mk
+new file mode 100644
+index 0000000..e4ff6ec
+--- /dev/null
++++ b/linux/buildroot-external/package/ble-tools/ble-tools.mk
+@@ -0,0 +1,32 @@
++################################################################################
++# ble-tools: hci_up, ble_scan, ble_adv, ble_server + ble-ap, ble-server
++# (Waveshare BLE, WS_BT=1)
++################################################################################
++
++BLE_TOOLS_VERSION = 1.0
++BLE_TOOLS_SITE = $(BR2_EXTERNAL_STAMP_P4_PATH)/../waveshare/ble-tools
++BLE_TOOLS_SITE_METHOD = local
++BLE_TOOLS_LICENSE = GPL-2.0-only
++BLE_TOOLS_PROGS = hci_up ble_scan ble_adv ble_server
++BLE_TOOLS_SCRIPTS = ble-ap ble-server
++
++define BLE_TOOLS_BUILD_CMDS
++	for p in $(BLE_TOOLS_PROGS); do \
++		$(TARGET_CC) $(TARGET_CFLAGS) -std=gnu11 -Wall -Os \
++			$(TARGET_LDFLAGS) -o $(@D)/$$p $(@D)/$$p.c || exit 1; \
++	done
++endef
++
++# m3-lab: every program needs a bFLT stack of at least 16000 bytes.
++define BLE_TOOLS_INSTALL_TARGET_CMDS
++	for p in $(BLE_TOOLS_PROGS); do \
++		$(INSTALL) -D -m 0755 $(@D)/$$p $(TARGET_DIR)/usr/bin/$$p || exit 1; \
++		$(HOST_DIR)/bin/$(GNU_TARGET_NAME)-flthdr -s 16384 $(TARGET_DIR)/usr/bin/$$p || exit 1; \
++		rm -f $(TARGET_DIR)/usr/bin/$$p.gdb; \
++	done
++	for s in $(BLE_TOOLS_SCRIPTS); do \
++		$(INSTALL) -D -m 0755 $(@D)/$$s $(TARGET_DIR)/usr/bin/$$s || exit 1; \
++	done
++endef
++
++$(eval $(generic-package))
+diff --git a/linux/buildroot-external/package/eh-wifi-sta/0003-linux-host-no-bt-stack-adapter.patch b/linux/buildroot-external/package/eh-wifi-sta/0003-linux-host-no-bt-stack-adapter.patch
+new file mode 100644
+index 0000000..08ea489
+--- /dev/null
++++ b/linux/buildroot-external/package/eh-wifi-sta/0003-linux-host-no-bt-stack-adapter.patch
+@@ -0,0 +1,22 @@
++From: Waveshare ESP32-P4-WIFI6 port
++Subject: [PATCH] Linux host: no BT host-stack adapter with FEAT_BT
++
++CONFIG_ESP_HOSTED_HOST_FEAT_BT pulled in esp_hosted_bt_host_stack, the
++NimBLE/Bluedroid adapter for MCU hosts, which needs FreeRTOS headers and
++does not build for a POSIX host.  On Linux the HCI traffic goes through
++the kernel module (hci0); eh-wifid only needs the controller RPCs
++(eh_host_bt_controller_*) from eh_host_feat_bt.
++---
++--- a/CMakeLists.txt
+++++ b/CMakeLists.txt
++@@ -106,7 +106,9 @@
++     add_subdirectory("${EH_PATH}/host"         ${CMAKE_BINARY_DIR}/host)
++ endif()
++ 
++-if(CONFIG_ESP_HOSTED_HOST_FEAT_BT)
+++# The NimBLE/Bluedroid adapter is for MCU hosts (FreeRTOS).  A Linux host
+++# reaches the controller through the kernel module's hci0 instead.
+++if(CONFIG_ESP_HOSTED_HOST_FEAT_BT AND NOT CONFIG_ESP_HOSTED_HOST_PORT_TYPE_POSIX)
++     add_subdirectory("${EH_PATH}/examples/common_components/esp_hosted_bt_host_stack"
++                      ${CMAKE_BINARY_DIR}/esp_hosted_bt_host_stack)
++ endif()
+diff --git a/linux/buildroot-external/package/esp-hosted-mcu/0002-bt-hci-on-demand.patch b/linux/buildroot-external/package/esp-hosted-mcu/0002-bt-hci-on-demand.patch
+new file mode 100644
+index 0000000..3ff19f3
+--- /dev/null
++++ b/linux/buildroot-external/package/esp-hosted-mcu/0002-bt-hci-on-demand.patch
+@@ -0,0 +1,138 @@
++From: Waveshare ESP32-P4-WIFI6 port
++Subject: [PATCH] eh_host_linux_kmod: register the BT HCI device on demand
++
++With CONFIG_BT_ENABLED the module registered hci0 as soon as the
++co-processor reported BT over SDIO, while the SDIO link was still coming
++up.  The earlier linux-waveshare-xc port of this board saw that burst
++wedge the kernel (its patches 0030/0035), and nothing uses BT at boot.
++
++New parameter bt_enable (default 0): writing 1 to
++/sys/module/esp_hosted_mcu/parameters/bt_enable registers the HCI device
++from a work item, once the link is up and only if the co-processor
++reports BT; otherwise it logs why not.  Registration and teardown are
++serialised by a mutex.  A co-processor reset tears hci0 down as before;
++with bt_enable still 1 it is registered again after the new boot-up event.
++---
++--- a/host/linux/eh_host_linux_kmod/driver/src/main.c
+++++ b/host/linux/eh_host_linux_kmod/driver/src/main.c
++@@ -29,6 +29,7 @@
++ #include <linux/netdevice.h>
++ #include <linux/gpio.h>
++ #include <linux/workqueue.h>
+++#include <linux/mutex.h>
++ /* Linux 7.x warns unless a bound workqueue names WQ_PERCPU explicitly. */
++ #include <linux/version.h>
++ /* WQ_PERCPU is an enum constant, not a macro: test the kernel version. */
++@@ -124,6 +125,69 @@
++ MODULE_PARM_DESC(spi_dataready, "SPI: Data Ready GPIO number");
++ 
++ struct esp_adapter adapter;
+++
+++/*
+++ * Waveshare ESP32-P4-WIFI6: HCI registration on demand.
+++ *
+++ * Registering the HCI device while the SDIO link is still coming up is
+++ * what wedged the kernel in the earlier linux-waveshare-xc port of this
+++ * board (its patches 0030/0035).  Nothing needs BT at boot, so the device
+++ * is registered only when someone asks for it:
+++ *
+++ *   echo 1 > /sys/module/esp_hosted_mcu/parameters/bt_enable
+++ *
+++ * (hci_up / ble_scan / ble_adv do it themselves).  It is one-way until the
+++ * co-processor resets; with a co-processor that reports no BT over SDIO
+++ * the request only logs that.
+++ */
+++static DEFINE_MUTEX(esp_bt_lock);
+++static bool esp_bt_enable;
+++
+++static bool esp_bt_cap(u32 cap)
+++{
+++	return (cap & ESP_BT_SPI_SUPPORT) || (cap & ESP_BT_SDIO_SUPPORT);
+++}
+++
+++static void esp_bt_enable_work_fn(struct work_struct *work)
+++{
+++	int ret;
+++
+++	mutex_lock(&esp_bt_lock);
+++	if (!esp_bt_enable || adapter.hcidev) {
+++		/* nothing to do */
+++	} else if (!adapter.if_context ||
+++		   atomic_read(&adapter.state) != ESP_CONTEXT_READY) {
+++		esp_info("bt_enable: co-processor link not ready yet\n");
+++	} else if (!esp_bt_cap(adapter.capabilities)) {
+++		esp_info("bt_enable: co-processor firmware has no BT over SDIO "
+++			 "(capabilities 0x%x)\n", adapter.capabilities);
+++	} else {
+++		esp_info("bt_enable: registering the HCI device\n");
+++		ret = esp_init_bt(&adapter);
+++		if (ret)
+++			esp_err("Failed to init BT: %d\n", ret);
+++	}
+++	mutex_unlock(&esp_bt_lock);
+++}
+++static DECLARE_WORK(esp_bt_enable_work, esp_bt_enable_work_fn);
+++
+++static int esp_bt_enable_set(const char *val, const struct kernel_param *kp)
+++{
+++	int ret = param_set_bool(val, kp);
+++
+++	if (ret)
+++		return ret;
+++	if (esp_bt_enable)
+++		schedule_work(&esp_bt_enable_work);
+++	return 0;
+++}
+++
+++static const struct kernel_param_ops esp_bt_enable_ops = {
+++	.set = esp_bt_enable_set,
+++	.get = param_get_bool,
+++};
+++module_param_cb(bt_enable, &esp_bt_enable_ops, &esp_bt_enable, 0644);
+++MODULE_PARM_DESC(bt_enable, "1 = register the HCI device (BLE) now; nothing at boot by default");
++ volatile u8 stop_data = 0;
++ 
++ 
++@@ -557,7 +621,6 @@
++ void process_capabilities(u8 cap)
++ {
++ 	struct esp_adapter *adapter = esp_get_adapter();
++-	int ret;
++ 
++ 	if (!adapter) {
++ 		esp_err("NULL adapter\n");
++@@ -568,14 +631,18 @@
++ 	adapter->capabilities = cap;
++ 
++ 	/* Reset BT */
+++	mutex_lock(&esp_bt_lock);
++ 	esp_deinit_bt(adapter);
+++	mutex_unlock(&esp_bt_lock);
++ 	msleep(200);
++ 
++-	if ((cap & ESP_BT_SPI_SUPPORT) || (cap & ESP_BT_SDIO_SUPPORT)) {
++-		ret = esp_init_bt(adapter);
++-		if (ret) {
++-			esp_err("Failed to init BT: %d\n", ret);
++-		}
+++	if (esp_bt_cap(cap)) {
+++		/* Waveshare: register the HCI device only on request (bt_enable). */
+++		if (esp_bt_enable)
+++			schedule_work(&esp_bt_enable_work);
+++		else
+++			esp_info("BT available on the co-processor; HCI registration deferred "
+++				 "(echo 1 > /sys/module/esp_hosted_mcu/parameters/bt_enable)\n");
++ 	} else if (cap & ESP_BT_UART_SUPPORT) {
++ 		// do nothing
++ 	} else {
++@@ -1320,7 +1387,10 @@
++ 
++ 	esp_serial_cleanup();
++ 
+++	cancel_work_sync(&esp_bt_enable_work);
+++	mutex_lock(&esp_bt_lock);
++ 	esp_deinit_bt(&adapter);
+++	mutex_unlock(&esp_bt_lock);
++ 	msleep(200);
++ 
++ #if TEST_RAW_TP
+diff --git a/linux/buildroot-external/package/esp-hosted-mcu/esp-hosted-mcu.mk b/linux/buildroot-external/package/esp-hosted-mcu/esp-hosted-mcu.mk
+index ac66e79..2f6b5ed 100644
+--- a/linux/buildroot-external/package/esp-hosted-mcu/esp-hosted-mcu.mk
++++ b/linux/buildroot-external/package/esp-hosted-mcu/esp-hosted-mcu.mk
+@@ -12,12 +12,15 @@ ESP_HOSTED_MCU_SITE_METHOD = local
+ ESP_HOSTED_MCU_LICENSE = GPL-2.0-only (kernel module)
+ ESP_HOSTED_MCU_DEPENDENCIES = linux
+ ESP_HOSTED_MCU_KMOD_DIR = $(@D)/host/linux/eh_host_linux_kmod/driver
++# BLE (esp_bt.c, hci0 on demand: patch 0002).  build-m1.sh passes
++# ESP_HOSTED_MCU_BT=n for WS_BT=0; the kernel then has no CONFIG_BT.
++ESP_HOSTED_MCU_BT ?= y
+ ESP_HOSTED_MCU_MODULE_MAKE_OPTS = \
+ 	target=sdio \
+ 	ESP_SLAVE=CONFIG_TARGET_ESP32C6 \
+ 	ARCH=$(KERNEL_ARCH) \
+ 	CROSS_COMPILE="$(TARGET_CROSS)" \
+-	CONFIG_BT_ENABLED=n \
++	CONFIG_BT_ENABLED=$(ESP_HOSTED_MCU_BT) \
+ 	CONFIG_TEST_RAW_TP=n \
+ 	CONFIG_DEBUG_LOGS=n
+ 
+diff --git a/linux/waveshare/ble-tools/LEEME.md b/linux/waveshare/ble-tools/LEEME.md
+new file mode 100644
+index 0000000..b7d3309
+--- /dev/null
++++ b/linux/waveshare/ble-tools/LEEME.md
+@@ -0,0 +1,41 @@
++# ble-tools (Waveshare ESP32-P4-WIFI6)
++
++`hci_up`, `ble_scan` y `ble_adv`, tomados de linux-waveshare-xc (GPL-2.0-only),
++y `ble_server` con sus scripts `ble-ap` y `ble-server`, hechos para esta placa.
++Hablan HCI directo con el controlador BLE del C6 por un socket
++`HCI_CHANNEL_USER`: no usan BlueZ, que necesita MMU.
++
++Cada uno hace dos cosas antes de usar `hci0`:
++1. Enciende el controlador BT del C6 con `bt-on`, que le pide a `eh-wifid`.
++   Si `hci0` se registra con el controlador apagado, el primer HCI Reset del
++   kernel falla (-110) y `hci0` queda ocupado hasta reiniciar.
++2. Pide el registro de `hci0` escribiendo 1 en
++   `/sys/module/esp_hosted_mcu/parameters/bt_enable`.
++
++Si el kernel ya levanto `hci0`, los programas lo bajan
++(`HCIDEVDOWN`) y lo toman. Si el firmware del C6 no trae Bluetooth, avisan
++que no hay `hci0`.
++
++- `ble_scan` escanea 20 s y muestra dirección, RSSI y nombre. `ble_scan reset`
++  solo prueba la ida y vuelta con el controlador.
++- `ble_adv [NOMBRE]` anuncia la placa hasta que se lo corta (no se puede
++  conectar).
++- `ble_server [NOMBRE]` anuncia la placa **conectable** y atiende un servidor
++  GATT propio (HCI, L2CAP, ATT y SMP escritos aca):
++  - Nordic UART Service: el celular escribe en RX y recibe en TX. `info` y
++    `uptime` tienen respuesta; el resto vuelve como `echo: ...`. Lo escrito en
++    la entrada estandar va al celular. Nada de lo que llega se ejecuta.
++  - Device Information: fabricante y modelo.
++  - Una conexion por vez; despues de desconectar vuelve a anunciar.
++  - Emparejamiento "Just Works" (sin PIN, sin proteccion MITM, no guarda
++    claves): el enlace va cifrado, pero cualquiera cerca se puede conectar.
++- `ble-ap [NOMBRE]`, `ble-ap stop`, `ble-ap status`: `ble_server` en segundo
++  plano, con log en `/run/ble-ap.log`.
++- `ble-server [NOMBRE]`: `ble_server` en primer plano, para probar a mano.
++- `hci_up` registra `hci0` y hace `HCIDEVUP`, el camino del kernel. Es para
++  diagnóstico.
++
++No pueden correr dos a la vez: el segundo recibe `EBUSY`.
++
++El C6 solo tiene BLE: no hay Bluetooth clasico (A2DP, parlante, SPP) ni LE
++Audio.
+diff --git a/linux/waveshare/ble-tools/ble-ap b/linux/waveshare/ble-tools/ble-ap
+new file mode 100755
+index 0000000..19ad575
+--- /dev/null
++++ b/linux/waveshare/ble-tools/ble-ap
+@@ -0,0 +1,58 @@
++#!/bin/sh
++# ble-ap — leave the BLE server running in the background: the board
++# advertises as a connectable BLE device (Nordic UART Service) that a phone
++# can connect to.  Log in /run/ble-ap.log.
++#
++#   ble-ap [NAME]     start (NAME defaults to the hostname)
++#   ble-ap stop       stop it
++#   ble-ap status     running or not, and the last log lines
++#
++# Only one BLE tool can use the controller at a time: stop it before
++# ble_scan, ble_adv or ble-server.  Pairing is "Just Works" (no PIN):
++# anyone nearby can connect, so do not send secrets.
++PID=/run/ble-ap.pid
++LOG=/run/ble-ap.log
++
++running() { [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; }
++
++case "${1:-}" in
++	stop)
++		if running; then
++			kill "$(cat "$PID")"
++			n=0
++			while running && [ "$n" -lt 20 ]; do sleep 0.2; n=$((n + 1)); done
++			echo "ble-ap: stopped"
++		else
++			echo "ble-ap: not running"
++		fi
++		rm -f "$PID"
++		;;
++	status)
++		if running; then echo "ble-ap: running (pid $(cat "$PID"))"; else echo "ble-ap: not running"; fi
++		[ -f "$LOG" ] && tail -n 8 "$LOG"
++		;;
++	-h|--help)
++		sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
++		;;
++	*)
++		if running; then
++			echo "ble-ap: already running (pid $(cat "$PID")); 'ble-ap stop' first"
++			exit 1
++		fi
++		ble_server "$@" </dev/null >"$LOG" 2>&1 &
++		echo $! > "$PID"
++		n=0
++		while [ "$n" -lt 40 ] && ! grep -q "advertising as\|failed\|no hci0\|bind" "$LOG" 2>/dev/null; do
++			sleep 0.25; n=$((n + 1))
++		done
++		if running && grep -q "advertising as" "$LOG"; then
++			grep "advertising as" "$LOG"
++			echo "ble-ap: log in $LOG ('ble-ap status', 'ble-ap stop')"
++		else
++			cat "$LOG"
++			echo "ble-ap: did not start"
++			rm -f "$PID"
++			exit 1
++		fi
++		;;
++esac
+diff --git a/linux/waveshare/ble-tools/ble-server b/linux/waveshare/ble-tools/ble-server
+new file mode 100755
+index 0000000..890a531
+--- /dev/null
++++ b/linux/waveshare/ble-tools/ble-server
+@@ -0,0 +1,13 @@
++#!/bin/sh
++# ble-server — interactive BLE test server in the foreground.  The board
++# advertises as NAME (default: hostname); connect from a phone app that
++# knows the Nordic UART Service (nRF Connect, Serial Bluetooth Terminal).
++# What the phone writes appears here; lines you type go to the phone.
++# The phone can also send 'info' or 'uptime'.  Ctrl-C to stop.
++#
++#   ble-server [NAME]
++if [ -f /run/ble-ap.pid ] && kill -0 "$(cat /run/ble-ap.pid)" 2>/dev/null; then
++	echo "ble-server: ble-ap is running in the background; 'ble-ap stop' first"
++	exit 1
++fi
++exec ble_server "$@"
+diff --git a/linux/waveshare/ble-tools/ble_adv.c b/linux/waveshare/ble-tools/ble_adv.c
+new file mode 100644
+index 0000000..df9d649
+--- /dev/null
++++ b/linux/waveshare/ble-tools/ble_adv.c
+@@ -0,0 +1,304 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Waveshare ESP32-P4-WIFI6 port (2026-11-27): taken from linux-waveshare-xc
++ * (patches/buildroot/overlay-src, GPL-2.0-only).  Changes: the ESP-Hosted-MCU
++ * module is esp_hosted_mcu (not esp32_sdio), over SDIO instead of SPI, and a
++ * clear message when hci0 does not appear (C6 firmware without BT).
++ */
++/*
++ * ble_adv — advertise this badge over BLE via ESP-Hosted HCI (C6 over SDIO).
++ *
++ * Sibling of ble_scan: binds a raw HCI socket with HCI_CHANNEL_USER
++ * (the kernel-init HCIDEVUP path hangs on this hardware), sends HCI
++ * Reset, programs LE advertising parameters + data (Flags + Complete
++ * Local Name), enables advertising, and then just sits there — the
++ * user channel resets the controller when the socket closes, so
++ * advertising only lasts as long as the process. Run it in the
++ * background: `ble_adv &`. Another badge's `ble_scan` then shows this
++ * one as an ADV line carrying the name.
++ *
++ * The controller is exclusive: ble_adv and ble_scan cannot run at the
++ * same time (the second bind fails with EBUSY), and BT is only up
++ * ~21 s after boot (patch 0030 defers HCI init).
++ *
++ * Usage:
++ *   ble_adv           advertise the hostname until killed
++ *   ble_adv NAME      advertise NAME (max 26 bytes; longer is cut)
++ *
++ * NOMMU/FLAT: raw write(2) only (no stdio through elf2flt), tiny
++ * resident footprint (~16 KB class, pool-backed).
++ */
++#include <unistd.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <signal.h>
++#include <stdint.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <sys/ioctl.h>
++
++#ifndef AF_BLUETOOTH
++#define AF_BLUETOOTH       31
++#endif
++#define BTPROTO_HCI        1
++#define HCI_CHANNEL_USER   1
++#define HCIDEVDOWN         _IOW('H', 202, int)
++
++#define HCI_COMMAND_PKT    0x01
++#define HCI_EVENT_PKT      0x04
++#define HCI_EVT_CMD_COMPL  0x0E
++#define HCI_EVT_CMD_STATUS 0x0F
++
++#define OP_RESET           0x0C03
++#define OP_LE_ADV_PARAMS   0x2006
++#define OP_LE_ADV_DATA     0x2008
++#define OP_LE_ADV_ENABLE   0x200A
++
++#define ADV_NAME_MAX       26	/* 31 - 3 (Flags AD) - 2 (Name AD hdr) */
++
++struct sockaddr_hci {
++	uint16_t hci_family;
++	uint16_t hci_dev;
++	uint16_t hci_channel;
++};
++
++static int sk = -1;
++static volatile sig_atomic_t stopping;
++
++static void say(const char *s) { write(1, s, strlen(s)); }
++
++static void hex2(uint8_t v)
++{
++	const char *h = "0123456789abcdef";
++	char b[2] = { h[v >> 4], h[v & 0xf] };
++	write(1, b, 2);
++}
++
++static void say_int(int v)
++{
++	char buf[16]; int n = 0; unsigned u;
++	if (v < 0) { write(1, "-", 1); u = -v; } else { u = v; }
++	if (u == 0) { write(1, "0", 1); return; }
++	while (u) { buf[n++] = '0' + u % 10; u /= 10; }
++	while (n--) write(1, &buf[n], 1);
++}
++
++static int hci_send_cmd(uint16_t opcode, const uint8_t *params, uint8_t plen)
++{
++	uint8_t pkt[260];
++	pkt[0] = HCI_COMMAND_PKT;
++	pkt[1] = opcode & 0xff;
++	pkt[2] = (opcode >> 8) & 0xff;
++	pkt[3] = plen;
++	if (plen) memcpy(&pkt[4], params, plen);
++	int n = write(sk, pkt, 4 + plen);
++	if (n < 0) {
++		say("write cmd 0x"); hex2(opcode>>8); hex2(opcode&0xff);
++		say(" failed errno="); say_int(errno); say("\n");
++		return -1;
++	}
++	return 0;
++}
++
++static int hci_read(uint8_t *buf, int max, int ms)
++{
++	struct pollfd p = { .fd = sk, .events = POLLIN };
++	int r = poll(&p, 1, ms);
++	if (r <= 0) return -1;
++	return read(sk, buf, max);
++}
++
++static int wait_cmd_complete(uint16_t opcode, int ms_total)
++{
++	uint8_t pkt[260];
++	int budget = ms_total;
++	while (budget > 0) {
++		int n = hci_read(pkt, sizeof pkt, budget);
++		if (n < 0) {
++			say("timeout waiting for op=0x");
++			hex2(opcode>>8); hex2(opcode&0xff); say("\n");
++			return -1;
++		}
++		if (n < 3 || pkt[0] != HCI_EVENT_PKT) { budget -= 50; continue; }
++		uint8_t evt = pkt[1];
++		if (evt == HCI_EVT_CMD_COMPL && n >= 6) {
++			uint16_t op = pkt[4] | (pkt[5] << 8);
++			if (op != opcode) { budget -= 50; continue; }
++			uint8_t status = (n >= 7) ? pkt[6] : 0xff;
++			say(" cmd_complete op=0x");
++			hex2(opcode>>8); hex2(opcode&0xff);
++			say(" status=0x"); hex2(status); say("\n");
++			return status;
++		}
++		if (evt == HCI_EVT_CMD_STATUS && n >= 6) {
++			uint16_t op = pkt[5] | (pkt[6] << 8);
++			if (op != opcode) { budget -= 50; continue; }
++			uint8_t status = pkt[3];
++			say(" cmd_status op=0x");
++			hex2(opcode>>8); hex2(opcode&0xff);
++			say(" status=0x"); hex2(status); say("\n");
++			return status;
++		}
++		budget -= 50;
++	}
++	say("budget exhausted op=0x");
++	hex2(opcode>>8); hex2(opcode&0xff); say("\n");
++	return -1;
++}
++
++static void on_signal(int sig)
++{
++	(void)sig;
++	stopping = 1;
++}
++
++/* Waveshare: the C6 BT controller must be on (eh-wifid "bt-on" RPC) before
++ * hci0 is registered; otherwise the kernel's first power-on of hci0 times
++ * out (HCI Reset -110) and hci0 stays busy until the next boot. */
++#include <sys/un.h>
++static void c6_bt_on(void)
++{
++	struct sockaddr_un a = { .sun_family = AF_UNIX };
++	char r[128];
++	int s = socket(AF_UNIX, SOCK_STREAM, 0), n;
++
++	strcpy(a.sun_path, "/run/eh-wifid.sock");
++	if (s < 0 || connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) {
++		write(2, "eh-wifid not running: cannot turn the C6 BT controller on\n", 59);
++		if (s >= 0)
++			close(s);
++		return;
++	}
++	write(s, "bt-on\n", 6);
++	shutdown(s, SHUT_WR);
++	n = read(s, r, sizeof(r) - 1);
++	if (n > 0 && r[0] != 'o')
++		write(2, r, n);
++	close(s);
++}
++
++int main(int argc, char **argv)
++{
++	char name[ADV_NAME_MAX + 1];
++	int name_len;
++
++	if (argc > 1) {
++		name_len = strlen(argv[1]);
++		if (name_len > ADV_NAME_MAX)
++			name_len = ADV_NAME_MAX;
++		memcpy(name, argv[1], name_len);
++	} else {
++		memset(name, 0, sizeof name);
++		if (gethostname(name, ADV_NAME_MAX) < 0)
++			memcpy(name, "why2025", 7);
++		name[ADV_NAME_MAX] = 0;
++		name_len = strlen(name);
++	}
++
++	say("ble_adv: open AF_BLUETOOTH/HCI socket\n");
++	sk = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
++	if (sk < 0) {
++		say("socket failed errno="); say_int(errno); say("\n");
++		return 1;
++	}
++
++	struct sockaddr_hci addr = {
++		.hci_family = AF_BLUETOOTH,
++		.hci_dev = 0,
++		.hci_channel = HCI_CHANNEL_USER,
++	};
++	/* HCI registration is opt-in since kernel patch 0035 (the boot-time
++	 * burst wedged cold boots): request it, then wait out ENODEV while
++	 * the kernel registers hci0 over the C6 SDIO link (a few seconds). */
++	c6_bt_on();
++	int kfd = open("/sys/module/esp_hosted_mcu/parameters/bt_enable", O_WRONLY);
++	if (kfd >= 0) {
++		write(kfd, "1", 1);
++		close(kfd);
++	}
++	say("ble_adv: bind hci0 CHANNEL_USER\n");
++	int tries = 0, downed = 0;
++	while (bind(sk, (struct sockaddr *)&addr, sizeof addr) < 0) {
++		if (errno != ENODEV || ++tries > 40) {
++			/* Waveshare: hci0 brought up by the kernel (registration
++		 * auto power-on, or hci_up) refuses the user channel with
++		 * EBUSY; take it down once and retry. */
++		if (errno == EBUSY && !downed) {
++			downed = 1;
++			say("hci0 is up in the kernel; HCIDEVDOWN and retry\n");
++			ioctl(sk, HCIDEVDOWN, 0);
++			usleep(200000);
++			continue;
++		}
++		if (errno == ENODEV) {
++				say("no hci0: the C6 firmware reports no Bluetooth "
++				    "(dmesg | grep -i bt)\n");
++				return 2;
++			}
++			say("bind failed errno="); say_int(errno);
++			say(" (16=EBUSY -> another HCI tool is running)\n");
++			return 2;
++		}
++		usleep(500000);
++	}
++
++	say("ble_adv: HCI Reset");
++	if (hci_send_cmd(OP_RESET, 0, 0) < 0) return 3;
++	if (wait_cmd_complete(OP_RESET, 5000) != 0) return 4;
++
++	/*
++	 * LE Set Advertising Parameters: interval min/max 0x00A0/0x00F0
++	 * (100/150 ms — 0x00A0 is the spec floor for non-connectable),
++	 * type 0x03 ADV_NONCONN_IND (nothing here accepts connections),
++	 * own addr public, all 3 channels, no filter.
++	 */
++	uint8_t ap[] = { 0xA0, 0x00, 0xF0, 0x00, 0x03, 0x00, 0x00,
++			 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00 };
++	say("ble_adv: LE Set Adv Params (nonconn, 100-150ms)");
++	if (hci_send_cmd(OP_LE_ADV_PARAMS, ap, sizeof ap) < 0) return 5;
++	if (wait_cmd_complete(OP_LE_ADV_PARAMS, 3000) != 0) return 5;
++
++	/*
++	 * LE Set Advertising Data: fixed 32-byte parameter block =
++	 * [significant_len][31 bytes]. Flags AD (LE General Discoverable,
++	 * BR/EDR not supported) + Complete Local Name.
++	 */
++	uint8_t ad[32];
++	memset(ad, 0, sizeof ad);
++	ad[1] = 0x02; ad[2] = 0x01; ad[3] = 0x06;	/* Flags */
++	ad[4] = (uint8_t)(name_len + 1);
++	ad[5] = 0x09;					/* Complete Local Name */
++	memcpy(&ad[6], name, name_len);
++	ad[0] = (uint8_t)(3 + 2 + name_len);		/* significant length */
++	say("ble_adv: LE Set Adv Data (name \"");
++	write(1, name, name_len);
++	say("\")");
++	if (hci_send_cmd(OP_LE_ADV_DATA, ad, sizeof ad) < 0) return 6;
++	if (wait_cmd_complete(OP_LE_ADV_DATA, 3000) != 0) return 6;
++
++	uint8_t en[] = { 0x01 };
++	say("ble_adv: LE Set Advertise Enable");
++	if (hci_send_cmd(OP_LE_ADV_ENABLE, en, sizeof en) < 0) return 7;
++	if (wait_cmd_complete(OP_LE_ADV_ENABLE, 3000) != 0) return 8;
++
++	signal(SIGINT, on_signal);
++	signal(SIGTERM, on_signal);
++	say("ble_adv: advertising; kill me to stop (controller resets on exit)\n");
++
++	/*
++	 * Park: drain any stray events so the socket buffer can't fill.
++	 * Advertising itself needs no host interaction.
++	 */
++	uint8_t tmp[260];
++	while (!stopping)
++		hci_read(tmp, sizeof tmp, 1000);
++
++	uint8_t dis[] = { 0x00 };
++	say("ble_adv: LE Set Advertise Disable");
++	hci_send_cmd(OP_LE_ADV_ENABLE, dis, sizeof dis);
++	(void) wait_cmd_complete(OP_LE_ADV_ENABLE, 2000);
++
++	close(sk);
++	return 0;
++}
+diff --git a/linux/waveshare/ble-tools/ble_scan.c b/linux/waveshare/ble-tools/ble_scan.c
+new file mode 100644
+index 0000000..eab3e67
+--- /dev/null
++++ b/linux/waveshare/ble-tools/ble_scan.c
+@@ -0,0 +1,347 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Waveshare ESP32-P4-WIFI6 port (2026-11-27): taken from linux-waveshare-xc
++ * (patches/buildroot/overlay-src, GPL-2.0-only).  Changes: the ESP-Hosted-MCU
++ * module is esp_hosted_mcu (not esp32_sdio), over SDIO instead of SPI, and a
++ * clear message when hci0 does not appear (C6 firmware without BT).
++ */
++/*
++ * ble_scan — minimal BLE LE scanner over ESP-Hosted HCI (C6 over SDIO).
++ *
++ * Binds a raw HCI socket with HCI_CHANNEL_USER to bypass the kernel's
++ * controller-init handshake (HCIDEVUP via the kernel-init path hangs on this
++ * hardware). Issues HCI Reset, sets active LE scan parameters, enables scan,
++ * and prints LE Advertising Reports as they arrive. Disables scan on exit.
++ *
++ * Usage:
++ *   ble_scan              full scan, ~20 s
++ *   ble_scan reset        send HCI Reset and exit (round-trip probe)
++ */
++#include <unistd.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <stdint.h>
++#include <poll.h>
++#include <time.h>
++#include <sys/socket.h>
++#include <sys/ioctl.h>
++
++#ifndef AF_BLUETOOTH
++#define AF_BLUETOOTH       31
++#endif
++#define BTPROTO_HCI        1
++#define HCI_CHANNEL_USER   1
++#define HCIDEVDOWN         _IOW('H', 202, int)
++
++#define HCI_COMMAND_PKT    0x01
++#define HCI_EVENT_PKT      0x04
++#define HCI_EVT_CMD_COMPL  0x0E
++#define HCI_EVT_CMD_STATUS 0x0F
++#define HCI_EVT_LE_META    0x3E
++#define HCI_LE_ADV_REPORT  0x02
++
++#define OP_RESET           0x0C03
++#define OP_SET_EVENT_MASK  0x0C01
++#define OP_LE_SET_EVT_MASK 0x2001
++#define OP_LE_SCAN_PARAMS  0x200B
++#define OP_LE_SCAN_ENABLE  0x200C
++
++struct sockaddr_hci {
++	uint16_t hci_family;
++	uint16_t hci_dev;
++	uint16_t hci_channel;
++};
++
++static int sk = -1;
++static int adv_count = 0;
++static int evt_count = 0;
++
++static void say(const char *s) { write(1, s, strlen(s)); }
++
++static void hex2(uint8_t v)
++{
++	const char *h = "0123456789abcdef";
++	char b[2] = { h[v >> 4], h[v & 0xf] };
++	write(1, b, 2);
++}
++
++static void say_int(int v)
++{
++	char buf[16]; int n = 0; unsigned u;
++	if (v < 0) { write(1, "-", 1); u = -v; } else { u = v; }
++	if (u == 0) { write(1, "0", 1); return; }
++	while (u) { buf[n++] = '0' + u % 10; u /= 10; }
++	while (n--) write(1, &buf[n], 1);
++}
++
++static int hci_send_cmd(uint16_t opcode, const uint8_t *params, uint8_t plen)
++{
++	uint8_t pkt[260];
++	pkt[0] = HCI_COMMAND_PKT;
++	pkt[1] = opcode & 0xff;
++	pkt[2] = (opcode >> 8) & 0xff;
++	pkt[3] = plen;
++	if (plen) memcpy(&pkt[4], params, plen);
++	int n = write(sk, pkt, 4 + plen);
++	if (n < 0) {
++		say("write cmd 0x"); hex2(opcode>>8); hex2(opcode&0xff);
++		say(" failed errno="); say_int(errno); say("\n");
++		return -1;
++	}
++	return 0;
++}
++
++static int hci_read(uint8_t *buf, int max, int ms)
++{
++	struct pollfd p = { .fd = sk, .events = POLLIN };
++	int r = poll(&p, 1, ms);
++	if (r <= 0) return -1;
++	return read(sk, buf, max);
++}
++
++static int wait_cmd_complete(uint16_t opcode, int ms_total)
++{
++	uint8_t pkt[260];
++	int budget = ms_total;
++	while (budget > 0) {
++		int n = hci_read(pkt, sizeof pkt, budget);
++		if (n < 0) {
++			say("timeout waiting for op=0x");
++			hex2(opcode>>8); hex2(opcode&0xff); say("\n");
++			return -1;
++		}
++		if (n < 3 || pkt[0] != HCI_EVENT_PKT) { budget -= 50; continue; }
++		uint8_t evt = pkt[1];
++		if (evt == HCI_EVT_CMD_COMPL && n >= 6) {
++			uint16_t op = pkt[4] | (pkt[5] << 8);
++			if (op != opcode) { budget -= 50; continue; }
++			uint8_t status = (n >= 7) ? pkt[6] : 0xff;
++			say(" cmd_complete op=0x");
++			hex2(opcode>>8); hex2(opcode&0xff);
++			say(" status=0x"); hex2(status); say("\n");
++			return status;
++		}
++		if (evt == HCI_EVT_CMD_STATUS && n >= 6) {
++			uint16_t op = pkt[5] | (pkt[6] << 8);
++			if (op != opcode) { budget -= 50; continue; }
++			uint8_t status = pkt[3];
++			say(" cmd_status op=0x");
++			hex2(opcode>>8); hex2(opcode&0xff);
++			say(" status=0x"); hex2(status); say("\n");
++			return status;
++		}
++		budget -= 50;
++	}
++	say("budget exhausted op=0x");
++	hex2(opcode>>8); hex2(opcode&0xff); say("\n");
++	return -1;
++}
++
++static void process_le_adv_report(const uint8_t *p, int n)
++{
++	/* p[0] = subevent (0x02 for adv report), p[1] = num_reports */
++	if (n < 2 || p[0] != HCI_LE_ADV_REPORT) {
++		say(" le-meta subevent=0x");
++		if (n >= 1) hex2(p[0]);
++		say(" len="); say_int(n); say("\n");
++		return;
++	}
++	int num = p[1];
++	const uint8_t *q = p + 2;
++	int rem = n - 2;
++	for (int i = 0; i < num && rem >= 9; i++) {
++		uint8_t evt_type = q[0];
++		uint8_t addr_type = q[1];
++		const uint8_t *addr = &q[2];
++		uint8_t len = q[8];
++		if (rem < 9 + len + 1) return;
++		int8_t rssi = (int8_t) q[9 + len];
++		(void)evt_type; (void)addr_type;
++		say("ADV ");
++		for (int j = 5; j >= 0; j--) {
++			hex2(addr[j]); if (j) write(1, ":", 1);
++		}
++		say(" type="); hex2(evt_type);
++		say(" at="); hex2(addr_type);
++		say(" rssi=");
++		if (rssi < 0) { write(1, "-", 1); say_int(-rssi); } else { say_int(rssi); }
++		say(" adlen="); say_int(len);
++		/* Waveshare: print the advertised name (AD type 0x08/0x09). */
++		for (int k = 0; k + 1 < len; ) {
++			uint8_t l = q[9 + k], t = q[9 + k + 1];
++			if (l == 0 || k + 1 + l > len)
++				break;
++			if (t == 0x08 || t == 0x09) {
++				say(" name=");
++				write(1, &q[9 + k + 2], l - 1);
++				break;
++			}
++			k += 1 + l;
++		}
++		say("\n");
++		adv_count++;
++		q += 9 + len + 1;
++		rem -= 9 + len + 1;
++	}
++}
++
++static long now_ms(void)
++{
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
++}
++
++/* Waveshare: the C6 BT controller must be on (eh-wifid "bt-on" RPC) before
++ * hci0 is registered; otherwise the kernel's first power-on of hci0 times
++ * out (HCI Reset -110) and hci0 stays busy until the next boot. */
++#include <sys/un.h>
++static void c6_bt_on(void)
++{
++	struct sockaddr_un a = { .sun_family = AF_UNIX };
++	char r[128];
++	int s = socket(AF_UNIX, SOCK_STREAM, 0), n;
++
++	strcpy(a.sun_path, "/run/eh-wifid.sock");
++	if (s < 0 || connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) {
++		write(2, "eh-wifid not running: cannot turn the C6 BT controller on\n", 59);
++		if (s >= 0)
++			close(s);
++		return;
++	}
++	write(s, "bt-on\n", 6);
++	shutdown(s, SHUT_WR);
++	n = read(s, r, sizeof(r) - 1);
++	if (n > 0 && r[0] != 'o')
++		write(2, r, n);
++	close(s);
++}
++
++int main(int argc, char **argv)
++{
++	int reset_only = (argc > 1);
++
++	say("ble_scan: open AF_BLUETOOTH/HCI socket\n");
++	sk = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
++	if (sk < 0) {
++		say("socket failed errno="); say_int(errno); say("\n");
++		return 1;
++	}
++
++	struct sockaddr_hci addr = {
++		.hci_family = AF_BLUETOOTH,
++		.hci_dev = 0,
++		.hci_channel = HCI_CHANNEL_USER,
++	};
++	/* HCI registration is opt-in since kernel patch 0035 (the boot-time
++	 * burst wedged cold boots): request it, then wait out ENODEV while
++	 * the kernel registers hci0 over the C6 SDIO link (a few seconds). */
++	c6_bt_on();
++	int kfd = open("/sys/module/esp_hosted_mcu/parameters/bt_enable", O_WRONLY);
++	if (kfd >= 0) {
++		write(kfd, "1", 1);
++		close(kfd);
++	}
++	say("ble_scan: bind hci0 CHANNEL_USER\n");
++	int tries = 0, downed = 0;
++	while (bind(sk, (struct sockaddr *)&addr, sizeof addr) < 0) {
++		if (errno != ENODEV || ++tries > 40) {
++			/* Waveshare: hci0 brought up by the kernel (registration
++		 * auto power-on, or hci_up) refuses the user channel with
++		 * EBUSY; take it down once and retry. */
++		if (errno == EBUSY && !downed) {
++			downed = 1;
++			say("hci0 is up in the kernel; HCIDEVDOWN and retry\n");
++			ioctl(sk, HCIDEVDOWN, 0);
++			usleep(200000);
++			continue;
++		}
++		if (errno == ENODEV) {
++				say("no hci0: the C6 firmware reports no Bluetooth "
++				    "(dmesg | grep -i bt)\n");
++				return 2;
++			}
++			say("bind failed errno="); say_int(errno);
++			say(" (16=EBUSY -> another HCI tool is running)\n");
++			return 2;
++		}
++		usleep(500000);
++	}
++
++	say("ble_scan: HCI Reset");
++	if (hci_send_cmd(OP_RESET, 0, 0) < 0) return 3;
++	if (wait_cmd_complete(OP_RESET, 5000) != 0) return 4;
++
++	if (reset_only) {
++		say("ble_scan: reset OK, exiting (reset-only)\n");
++		close(sk);
++		return 0;
++	}
++
++	/* Drain any pending events. */
++	uint8_t tmp[260];
++	for (;;) {
++		int n = hci_read(tmp, sizeof tmp, 100);
++		if (n <= 0) break;
++	}
++
++	/* HCI_RESET above wiped event masks back to spec defaults — which
++	 * exclude the LE Meta Event. Re-enable, otherwise adv reports never
++	 * leave the controller. Mask matches BlueZ's default. */
++	uint8_t evm[] = { 0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d };
++	say("ble_scan: Set Event Mask (incl. LE Meta)");
++	if (hci_send_cmd(OP_SET_EVENT_MASK, evm, sizeof evm) < 0) return 5;
++	if (wait_cmd_complete(OP_SET_EVENT_MASK, 3000) != 0) return 5;
++
++	/* LE Event Mask: enable adv report, conn complete, conn update, etc. */
++	uint8_t levm[] = { 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
++	say("ble_scan: LE Set Event Mask");
++	if (hci_send_cmd(OP_LE_SET_EVT_MASK, levm, sizeof levm) < 0) return 5;
++	if (wait_cmd_complete(OP_LE_SET_EVT_MASK, 3000) != 0) return 5;
++
++	/* LE Set Scan Parameters: type=active(1), interval=0x60, window=0x30,
++	 * own_addr_type=public(0), filter_policy=accept_all(0).
++	 * Active scan TXs scan_req on undirected adverts -> more responses. */
++	uint8_t sp[] = { 0x01, 0x60, 0x00, 0x30, 0x00, 0x00, 0x00 };
++	say("ble_scan: LE Set Scan Params (active, 60ms/30ms)");
++	if (hci_send_cmd(OP_LE_SCAN_PARAMS, sp, sizeof sp) < 0) return 5;
++	if (wait_cmd_complete(OP_LE_SCAN_PARAMS, 3000) != 0) return 6;
++
++	/* LE Set Scan Enable: enable=1, filter_dups=0. */
++	uint8_t se[] = { 0x01, 0x00 };
++	say("ble_scan: LE Set Scan Enable");
++	if (hci_send_cmd(OP_LE_SCAN_ENABLE, se, sizeof se) < 0) return 7;
++	if (wait_cmd_complete(OP_LE_SCAN_ENABLE, 3000) != 0) return 8;
++
++	say("ble_scan: scanning for 20 seconds...\n");
++	uint8_t pkt[260];
++	long t_end = now_ms() + 20000;
++	for (;;) {
++		long left = t_end - now_ms();
++		if (left <= 0) break;
++		int n = hci_read(pkt, sizeof pkt, left > 500 ? 500 : (int)left);
++		if (n <= 0) continue;
++		evt_count++;
++		if (n >= 3 && pkt[0] == HCI_EVENT_PKT && pkt[1] == HCI_EVT_LE_META) {
++			process_le_adv_report(&pkt[3], n - 3);
++		} else if (n >= 2 && pkt[0] == HCI_EVENT_PKT) {
++			/* Print other events (status, etc.) so we can tell whether the
++			 * controller is silent or just chatty in non-LE form. */
++			say(" evt=0x"); hex2(pkt[1]); say(" plen="); say_int(pkt[2]); say("\n");
++		} else {
++			say(" rx pkt[0]=0x"); hex2(pkt[0]); say(" len="); say_int(n); say("\n");
++		}
++	}
++
++	uint8_t sd[] = { 0x00, 0x00 };
++	say("ble_scan: LE Set Scan Disable");
++	hci_send_cmd(OP_LE_SCAN_ENABLE, sd, sizeof sd);
++	(void) wait_cmd_complete(OP_LE_SCAN_ENABLE, 2000);
++
++	say("ble_scan: total events="); say_int(evt_count);
++	say(" advertising_reports="); say_int(adv_count); say("\n");
++
++	close(sk);
++	return adv_count > 0 ? 0 : 9;
++}
+diff --git a/linux/waveshare/ble-tools/ble_server.c b/linux/waveshare/ble-tools/ble_server.c
+new file mode 100644
+index 0000000..301200c
+--- /dev/null
++++ b/linux/waveshare/ble-tools/ble_server.c
+@@ -0,0 +1,1127 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * ble_server — connectable BLE peripheral with a minimal GATT server, for
++ * the Waveshare ESP32-P4-WIFI6 (BLE controller on the C6, HCI over SDIO).
++ *
++ * There is no BlueZ on the board: like ble_scan/ble_adv this binds hci0
++ * with HCI_CHANNEL_USER and speaks HCI, L2CAP and ATT itself.
++ *
++ * GATT database:
++ *   Generic Access (0x1800)     Device Name, Appearance
++ *   Generic Attribute (0x1801)
++ *   Nordic UART Service         6E400001-B5A3-F393-E0A9-E50E24DCCA9E
++ *     RX 6E400002-...  write / write without response   (phone -> board)
++ *     TX 6E400003-...  notify                           (board -> phone)
++ *   Device Information (0x180A) Manufacturer, Model (read)
++ *
++ * Phone apps that know the Nordic UART Service (nRF Connect, Serial
++ * Bluetooth Terminal, ...) show it as a text console.  What the phone
++ * writes is printed here as "rx: ..." and answered on TX:
++ *   info     board name, kernel, uptime
++ *   uptime   seconds since boot
++ *   anything else is echoed back ("echo: ...")
++ * Lines typed on stdin are sent to the phone (when it has notifications on).
++ * Nothing the phone sends is ever run as a command.
++ *
++ * One connection at a time; advertising restarts after a disconnect.
++ * Pairing: "Just Works" only (no PIN, no MITM protection, nothing stored),
++ * for phones that pair before anything else.  Anyone nearby can connect:
++ * do not send secrets.
++ *
++ * Usage:
++ *   ble_server            advertise the hostname
++ *   ble_server NAME       advertise NAME (max 29 bytes; longer is cut)
++ *
++ * NOMMU/FLAT: raw write(2) only, no stdio.
++ */
++#include <unistd.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <signal.h>
++#include <stdint.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <sys/ioctl.h>
++#include <sys/un.h>
++#include <sys/utsname.h>
++
++#ifndef AF_BLUETOOTH
++#define AF_BLUETOOTH       31
++#endif
++#define BTPROTO_HCI        1
++#define HCI_CHANNEL_USER   1
++#define HCIDEVDOWN         _IOW('H', 202, int)
++
++#define HCI_COMMAND_PKT    0x01
++#define HCI_ACL_PKT        0x02
++#define HCI_EVENT_PKT      0x04
++
++#define EVT_DISCONN_COMPL  0x05
++#define EVT_CMD_COMPL      0x0E
++#define EVT_CMD_STATUS     0x0F
++#define EVT_NUM_COMPL_PKTS 0x13
++#define EVT_LE_META        0x3E
++#define LE_CONN_COMPL      0x01
++#define LE_ENH_CONN_COMPL  0x0A
++
++#define OP_SET_EVENT_MASK  0x0C01
++#define OP_RESET           0x0C03
++#define OP_READ_BD_ADDR    0x1009
++#define OP_READ_BUF_SIZE   0x1005
++#define OP_LE_READ_BUF     0x2002
++#define OP_LE_ADV_PARAMS   0x2006
++#define OP_LE_ADV_DATA     0x2008
++#define OP_LE_SCAN_RSP     0x2009
++#define OP_LE_ADV_ENABLE   0x200A
++#define OP_DISCONNECT      0x0406
++
++#define CID_ATT            0x0004
++#define CID_LE_SIG         0x0005
++#define CID_SMP            0x0006
++
++#define NAME_MAX_LEN       29	/* scan response: 31 - 2 (AD header) */
++#define ATT_MTU_MAX        247
++
++struct sockaddr_hci {
++	uint16_t hci_family;
++	uint16_t hci_dev;
++	uint16_t hci_channel;
++};
++
++static int sk = -1;
++static volatile sig_atomic_t stopping;
++
++/* ------------------------------------------------------------ output ---- */
++
++static void say(const char *s) { write(1, s, strlen(s)); }
++
++static void hex2(uint8_t v)
++{
++	const char *h = "0123456789abcdef";
++	char b[2] = { h[v >> 4], h[v & 0xf] };
++	write(1, b, 2);
++}
++
++static int fmt_uint(char *b, unsigned u)
++{
++	char t[12]; int n = 0, i = 0;
++	if (u == 0) t[n++] = '0';
++	while (u) { t[n++] = '0' + u % 10; u /= 10; }
++	while (n) b[i++] = t[--n];
++	return i;
++}
++
++static void say_int(int v)
++{
++	char b[12]; int n;
++	if (v < 0) { write(1, "-", 1); v = -v; }
++	n = fmt_uint(b, (unsigned)v);
++	write(1, b, n);
++}
++
++static void say_addr(const uint8_t *a)	/* little-endian BD_ADDR */
++{
++	for (int i = 5; i >= 0; i--) {
++		hex2(a[i]);
++		if (i) write(1, ":", 1);
++	}
++}
++
++/* Print what the phone sent: printable ASCII as is, the rest as \xNN. */
++static void say_data(const uint8_t *d, int n)
++{
++	for (int i = 0; i < n; i++) {
++		if (d[i] >= 0x20 && d[i] < 0x7f) {
++			write(1, &d[i], 1);
++		} else if (d[i] == '\n' || d[i] == '\r') {
++			continue;
++		} else {
++			say("\\x"); hex2(d[i]);
++		}
++	}
++}
++
++/* --------------------------------------------------------------- HCI ---- */
++
++static int hci_send_cmd(uint16_t opcode, const uint8_t *params, uint8_t plen)
++{
++	uint8_t pkt[260];
++	pkt[0] = HCI_COMMAND_PKT;
++	pkt[1] = opcode & 0xff;
++	pkt[2] = opcode >> 8;
++	pkt[3] = plen;
++	if (plen) memcpy(&pkt[4], params, plen);
++	if (write(sk, pkt, 4 + plen) < 0) {
++		say("write cmd 0x"); hex2(opcode >> 8); hex2(opcode & 0xff);
++		say(" failed errno="); say_int(errno); say("\n");
++		return -1;
++	}
++	return 0;
++}
++
++static int hci_read(uint8_t *buf, int max, int ms)
++{
++	struct pollfd p = { .fd = sk, .events = POLLIN };
++	if (poll(&p, 1, ms) <= 0) return -1;
++	return read(sk, buf, max);
++}
++
++/* Send a command and wait for its Command Complete (or Status).  Returns the
++ * status byte; the return parameters after it are copied to ret. */
++static int hci_cmd(uint16_t opcode, const uint8_t *params, uint8_t plen,
++		   uint8_t *ret, int retmax)
++{
++	uint8_t pkt[260];
++	int budget = 40;	/* x 100 ms */
++
++	if (hci_send_cmd(opcode, params, plen) < 0) return -1;
++	while (budget-- > 0) {
++		int n = hci_read(pkt, sizeof pkt, 100);
++		if (n < 3 || pkt[0] != HCI_EVENT_PKT) continue;
++		if (pkt[1] == EVT_CMD_COMPL && n >= 7 &&
++		    (pkt[4] | pkt[5] << 8) == opcode) {
++			if (ret && n > 7) {
++				int c = n - 7 < retmax ? n - 7 : retmax;
++				memcpy(ret, &pkt[7], c);
++			}
++			return pkt[6];
++		}
++		if (pkt[1] == EVT_CMD_STATUS && n >= 7 &&
++		    (pkt[5] | pkt[6] << 8) == opcode)
++			return pkt[3];
++	}
++	say("no answer to HCI command 0x"); hex2(opcode >> 8); hex2(opcode & 0xff);
++	say("\n");
++	return -1;
++}
++
++static int must(const char *what, uint16_t op, const uint8_t *p, uint8_t n)
++{
++	int st = hci_cmd(op, p, n, 0, 0);
++	if (st != 0) {
++		say("ble_server: "); say(what); say(" failed, status=");
++		say_int(st); say("\n");
++		return -1;
++	}
++	return 0;
++}
++
++/* Waveshare: the C6 BT controller must be on (eh-wifid "bt-on" RPC) before
++ * hci0 is registered; otherwise the kernel's first power-on of hci0 times
++ * out (HCI Reset -110) and hci0 stays busy until the next boot. */
++static void c6_bt_on(void)
++{
++	struct sockaddr_un a = { .sun_family = AF_UNIX };
++	char r[128];
++	int s = socket(AF_UNIX, SOCK_STREAM, 0), n;
++
++	strcpy(a.sun_path, "/run/eh-wifid.sock");
++	if (s < 0 || connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) {
++		write(2, "eh-wifid not running: cannot turn the C6 BT controller on\n", 59);
++		if (s >= 0)
++			close(s);
++		return;
++	}
++	write(s, "bt-on\n", 6);
++	shutdown(s, SHUT_WR);
++	n = read(s, r, sizeof(r) - 1);
++	if (n > 0 && r[0] != 'o')
++		write(2, r, n);
++	close(s);
++}
++
++static int open_hci(void)
++{
++	struct sockaddr_hci addr = {
++		.hci_family = AF_BLUETOOTH,
++		.hci_dev = 0,
++		.hci_channel = HCI_CHANNEL_USER,
++	};
++	int tries = 0, downed = 0, kfd;
++
++	sk = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
++	if (sk < 0) {
++		say("socket failed errno="); say_int(errno); say("\n");
++		return -1;
++	}
++	c6_bt_on();
++	kfd = open("/sys/module/esp_hosted_mcu/parameters/bt_enable", O_WRONLY);
++	if (kfd >= 0) {
++		write(kfd, "1", 1);
++		close(kfd);
++	}
++	while (bind(sk, (struct sockaddr *)&addr, sizeof addr) < 0) {
++		if (errno == EBUSY && !downed) {
++			/* hci0 up in the kernel: take it down once. */
++			downed = 1;
++			ioctl(sk, HCIDEVDOWN, 0);
++			usleep(200000);
++			continue;
++		}
++		if (errno != ENODEV || ++tries > 40) {
++			if (errno == ENODEV)
++				say("no hci0: the C6 firmware reports no Bluetooth "
++				    "(dmesg | grep -i bt)\n");
++			else {
++				say("bind failed errno="); say_int(errno);
++				say(" (16=EBUSY -> another BLE tool is running)\n");
++			}
++			return -1;
++		}
++		usleep(500000);
++	}
++	return 0;
++}
++
++/* ----------------------------------------------------- ACL send queue ---- */
++
++static uint16_t conn = 0xffff;		/* connection handle, 0xffff = none */
++static int acl_len = 27, acl_credits = 1;
++static uint8_t txq[8][ATT_MTU_MAX + 9];
++static int txq_len[8], txq_head, txq_n;
++
++static void acl_flush(void)
++{
++	while (txq_n && acl_credits > 0) {
++		if (write(sk, txq[txq_head], txq_len[txq_head]) < 0) {
++			say("ACL write failed errno="); say_int(errno); say("\n");
++		} else {
++			acl_credits--;
++		}
++		txq_head = (txq_head + 1) % 8;
++		txq_n--;
++	}
++}
++
++/* Queue one L2CAP frame (always fits one ACL packet: MTU <= acl_len - 4). */
++static void l2cap_send(uint16_t cid, const uint8_t *d, int n)
++{
++	int slot;
++	uint8_t *p;
++
++	if (conn == 0xffff) return;
++	if (txq_n == 8) {
++		say("send queue full: dropped a packet\n");
++		return;
++	}
++	slot = (txq_head + txq_n) % 8;
++	p = txq[slot];
++	p[0] = HCI_ACL_PKT;
++	p[1] = conn & 0xff;
++	p[2] = ((conn >> 8) & 0x0f) | 0x00;	/* PB=00 first non-flushable, BC=0 */
++	p[3] = (n + 4) & 0xff;
++	p[4] = (n + 4) >> 8;
++	p[5] = n & 0xff;
++	p[6] = n >> 8;
++	p[7] = cid & 0xff;
++	p[8] = cid >> 8;
++	memcpy(&p[9], d, n);
++	txq_len[slot] = 9 + n;
++	txq_n++;
++	acl_flush();
++}
++
++/* -------------------------------------------------------- GATT table ---- */
++
++#define PROP_READ      0x02
++#define PROP_WRITE_NR  0x04
++#define PROP_WRITE     0x08
++#define PROP_NOTIFY    0x10
++
++/* 128-bit UUIDs are stored little-endian, as they go over the air. */
++static const uint8_t uuid_nus[16] = {
++	0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
++	0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e };
++static const uint8_t uuid_nus_rx[16] = {
++	0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
++	0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0x40, 0x6e };
++static const uint8_t uuid_nus_tx[16] = {
++	0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
++	0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e };
++
++struct attr {
++	uint16_t type16;		/* 0 when type128 is used */
++	const uint8_t *type128;
++	uint8_t val[24];		/* static value */
++	uint8_t len;
++	uint8_t writable;
++};
++
++enum {
++	H_GAP = 1, H_NAME_D, H_NAME, H_APP_D, H_APP,
++	H_GATT,
++	H_NUS, H_RX_D, H_RX, H_TX_D, H_TX, H_TX_CCC,
++	H_DIS, H_MAN_D, H_MAN, H_MOD_D, H_MOD,
++	H_LAST = H_MOD
++};
++
++static struct attr db[H_LAST + 1];
++static char dev_name[NAME_MAX_LEN + 1];
++static int dev_name_len;
++static const char manufacturer[] = "Waveshare";
++static const char model[] = "ESP32-P4-WIFI6 Linux";
++static int notify_on;
++static int att_mtu = 23, att_mtu_server = 23;
++
++static void set16(struct attr *a, uint16_t type, uint16_t v)
++{
++	a->type16 = type;
++	a->val[0] = v & 0xff;
++	a->val[1] = v >> 8;
++	a->len = 2;
++}
++
++static void set_service128(struct attr *a, const uint8_t *u)
++{
++	a->type16 = 0x2800;
++	memcpy(a->val, u, 16);
++	a->len = 16;
++}
++
++static void set_char(struct attr *a, uint8_t props, uint16_t vhandle,
++		     uint16_t u16, const uint8_t *u128)
++{
++	a->type16 = 0x2803;
++	a->val[0] = props;
++	a->val[1] = vhandle & 0xff;
++	a->val[2] = vhandle >> 8;
++	if (u128) {
++		memcpy(&a->val[3], u128, 16);
++		a->len = 19;
++	} else {
++		a->val[3] = u16 & 0xff;
++		a->val[4] = u16 >> 8;
++		a->len = 5;
++	}
++}
++
++static void build_db(void)
++{
++	memset(db, 0, sizeof db);
++	set16(&db[H_GAP], 0x2800, 0x1800);
++	set_char(&db[H_NAME_D], PROP_READ, H_NAME, 0x2A00, 0);
++	db[H_NAME].type16 = 0x2A00;		/* value: dev_name */
++	set_char(&db[H_APP_D], PROP_READ, H_APP, 0x2A01, 0);
++	set16(&db[H_APP], 0x2A01, 0x0000);	/* unknown appearance */
++	set16(&db[H_GATT], 0x2800, 0x1801);
++	set_service128(&db[H_NUS], uuid_nus);
++	set_char(&db[H_RX_D], PROP_WRITE | PROP_WRITE_NR, H_RX, 0, uuid_nus_rx);
++	db[H_RX].type128 = uuid_nus_rx;
++	db[H_RX].writable = 1;
++	set_char(&db[H_TX_D], PROP_NOTIFY, H_TX, 0, uuid_nus_tx);
++	db[H_TX].type128 = uuid_nus_tx;
++	set16(&db[H_TX_CCC], 0x2902, 0x0000);
++	db[H_TX_CCC].writable = 1;
++	set16(&db[H_DIS], 0x2800, 0x180A);
++	set_char(&db[H_MAN_D], PROP_READ, H_MAN, 0x2A29, 0);
++	db[H_MAN].type16 = 0x2A29;
++	set_char(&db[H_MOD_D], PROP_READ, H_MOD, 0x2A24, 0);
++	db[H_MOD].type16 = 0x2A24;
++}
++
++/* Value of attribute h (dynamic ones: name, manufacturer, model). */
++static const uint8_t *attr_val(int h, int *len)
++{
++	switch (h) {
++	case H_NAME: *len = dev_name_len; return (const uint8_t *)dev_name;
++	case H_MAN: *len = sizeof manufacturer - 1; return (const uint8_t *)manufacturer;
++	case H_MOD: *len = sizeof model - 1; return (const uint8_t *)model;
++	case H_TX: *len = 0; return db[h].val;
++	default: *len = db[h].len; return db[h].val;
++	}
++}
++
++static int is_service(int h)
++{
++	return db[h].type16 == 0x2800;
++}
++
++/* Last handle of the service that starts at h. */
++static int group_end(int h)
++{
++	int e = h;
++	while (e < H_LAST && !is_service(e + 1))
++		e++;
++	return e;
++}
++
++/* Does attribute h have the given type (2- or 16-byte UUID, LE)? */
++static int type_is(int h, const uint8_t *u, int ulen)
++{
++	if (ulen == 2)
++		return !db[h].type128 && db[h].type16 == (u[0] | u[1] << 8);
++	if (ulen == 16) {
++		/* 16-bit types written as Bluetooth-base 128-bit UUIDs */
++		static const uint8_t base[12] = {
++			0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
++			0x00, 0x10, 0x00, 0x00 };
++		if (db[h].type128)
++			return !memcmp(db[h].type128, u, 16);
++		return !memcmp(u, base, 12) &&
++		       db[h].type16 == (u[12] | u[13] << 8) && !u[14] && !u[15];
++	}
++	return 0;
++}
++
++/* ------------------------------------------------------------- ATT ---- */
++
++#define ATT_ERR_INVALID_HANDLE   0x01
++#define ATT_ERR_READ_NOT_PERM    0x02
++#define ATT_ERR_WRITE_NOT_PERM   0x03
++#define ATT_ERR_INVALID_PDU      0x04
++#define ATT_ERR_REQ_NOT_SUPP     0x06
++#define ATT_ERR_INVALID_OFFSET   0x07
++#define ATT_ERR_NOT_FOUND        0x0A
++#define ATT_ERR_UNSUPP_GROUP     0x10
++
++static void att_error(uint8_t req, uint16_t h, uint8_t err)
++{
++	uint8_t r[5] = { 0x01, req, h & 0xff, h >> 8, err };
++	l2cap_send(CID_ATT, r, 5);
++}
++
++static void notify(const uint8_t *d, int n)
++{
++	uint8_t p[ATT_MTU_MAX];
++
++	if (conn == 0xffff || !notify_on) return;
++	if (n > att_mtu - 3) n = att_mtu - 3;
++	p[0] = 0x1B;
++	p[1] = H_TX & 0xff;
++	p[2] = H_TX >> 8;
++	memcpy(&p[3], d, n);
++	l2cap_send(CID_ATT, p, 3 + n);
++}
++
++/* Answer a line the phone wrote on RX. */
++static void on_rx(const uint8_t *d, int n)
++{
++	char line[ATT_MTU_MAX + 1], out[ATT_MTU_MAX + 8];
++	int k = 0;
++
++	say("rx: "); say_data(d, n); say("\n");
++	for (int i = 0; i < n && k < ATT_MTU_MAX; i++)
++		if (d[i] != '\r' && d[i] != '\n')
++			line[k++] = d[i];
++	line[k] = 0;
++
++	if (!strcmp(line, "info")) {
++		struct utsname u;
++		int o = 0;
++		uname(&u);
++		o += strlen(strcpy(out + o, dev_name));
++		o += strlen(strcpy(out + o, ": Linux "));
++		o += strlen(strcpy(out + o, u.release));
++		out[o++] = '\n';
++		notify((uint8_t *)out, o);
++	} else if (!strcmp(line, "uptime")) {
++		char b[64];
++		int fd = open("/proc/uptime", O_RDONLY), r = -1;
++		if (fd >= 0) { r = read(fd, b, sizeof b - 1); close(fd); }
++		if (r > 0) {
++			int i = 0;
++			while (i < r && b[i] != ' ' && b[i] != '.') i++;
++			memcpy(out, "uptime ", 7);
++			memcpy(out + 7, b, i);
++			memcpy(out + 7 + i, " s\n", 3);
++			notify((uint8_t *)out, 10 + i);
++		}
++	} else {
++		memcpy(out, "echo: ", 6);
++		memcpy(out + 6, line, k);
++		out[6 + k] = '\n';
++		notify((uint8_t *)out, 7 + k);
++	}
++}
++
++static void att_handle(const uint8_t *p, int n)
++{
++	uint8_t r[ATT_MTU_MAX];
++	uint8_t op;
++	int o;
++
++	if (n < 1) return;
++	op = p[0];
++	switch (op) {
++	case 0x02: {	/* Exchange MTU */
++		int client;
++		if (n < 3) { att_error(op, 0, ATT_ERR_INVALID_PDU); return; }
++		client = p[1] | p[2] << 8;
++		att_mtu = client < att_mtu_server ? client : att_mtu_server;
++		if (att_mtu < 23) att_mtu = 23;
++		r[0] = 0x03; r[1] = att_mtu_server & 0xff; r[2] = att_mtu_server >> 8;
++		l2cap_send(CID_ATT, r, 3);
++		say("ATT MTU "); say_int(att_mtu); say("\n");
++		return;
++	}
++	case 0x04: {	/* Find Information */
++		int s, e, fmt = 0;
++		if (n < 5) { att_error(op, 0, ATT_ERR_INVALID_PDU); return; }
++		s = p[1] | p[2] << 8; e = p[3] | p[4] << 8;
++		if (!s || s > e) { att_error(op, s, ATT_ERR_INVALID_HANDLE); return; }
++		r[0] = 0x05; o = 2;
++		for (int h = s; h <= e && h <= H_LAST; h++) {
++			int f = db[h].type128 ? 2 : 1, sz = f == 1 ? 4 : 18;
++			if (!fmt) fmt = f;
++			if (f != fmt || o + sz > att_mtu) break;
++			r[o++] = h & 0xff; r[o++] = h >> 8;
++			if (f == 1) { r[o++] = db[h].type16 & 0xff; r[o++] = db[h].type16 >> 8; }
++			else { memcpy(&r[o], db[h].type128, 16); o += 16; }
++		}
++		if (!fmt) { att_error(op, s, ATT_ERR_NOT_FOUND); return; }
++		r[1] = fmt;
++		l2cap_send(CID_ATT, r, o);
++		return;
++	}
++	case 0x06: {	/* Find By Type Value (primary service discovery by UUID) */
++		int s, e, vlen;
++		if (n < 7) { att_error(op, 0, ATT_ERR_INVALID_PDU); return; }
++		s = p[1] | p[2] << 8; e = p[3] | p[4] << 8;
++		vlen = n - 7;
++		r[0] = 0x07; o = 1;
++		for (int h = s; h <= e && h <= H_LAST && o + 4 <= att_mtu; h++) {
++			int len;
++			const uint8_t *v = attr_val(h, &len);
++			if (!db[h].type128 && db[h].type16 == (p[5] | p[6] << 8) &&
++			    len == vlen && !memcmp(v, &p[7], vlen)) {
++				int ge = is_service(h) ? group_end(h) : h;
++				r[o++] = h & 0xff; r[o++] = h >> 8;
++				r[o++] = ge & 0xff; r[o++] = ge >> 8;
++			}
++		}
++		if (o == 1) { att_error(op, s, ATT_ERR_NOT_FOUND); return; }
++		l2cap_send(CID_ATT, r, o);
++		return;
++	}
++	case 0x08:	/* Read By Type */
++	case 0x10: {	/* Read By Group Type */
++		int s, e, ulen = n - 5, each = 0;
++		if (n != 7 && n != 21) { att_error(op, 0, ATT_ERR_INVALID_PDU); return; }
++		s = p[1] | p[2] << 8; e = p[3] | p[4] << 8;
++		if (!s || s > e) { att_error(op, s, ATT_ERR_INVALID_HANDLE); return; }
++		if (op == 0x10 && !(ulen == 2 && (p[5] | p[6] << 8) == 0x2800)) {
++			att_error(op, s, ATT_ERR_UNSUPP_GROUP);
++			return;
++		}
++		r[0] = op + 1; o = 2;
++		for (int h = s; h <= e && h <= H_LAST; h++) {
++			int len, sz;
++			const uint8_t *v;
++			if (!type_is(h, &p[5], ulen)) continue;
++			v = attr_val(h, &len);
++			if (op == 0x08 && len > att_mtu - 4) len = att_mtu - 4;
++			sz = (op == 0x10 ? 4 : 2) + len;
++			if (!each) each = sz;
++			if (sz != each || o + sz > att_mtu) break;
++			r[o++] = h & 0xff; r[o++] = h >> 8;
++			if (op == 0x10) {
++				int ge = group_end(h);
++				r[o++] = ge & 0xff; r[o++] = ge >> 8;
++			}
++			memcpy(&r[o], v, len); o += len;
++		}
++		if (!each) { att_error(op, s, ATT_ERR_NOT_FOUND); return; }
++		r[1] = each;
++		l2cap_send(CID_ATT, r, o);
++		return;
++	}
++	case 0x0A:	/* Read */
++	case 0x0C: {	/* Read Blob */
++		int h, off = 0, len;
++		const uint8_t *v;
++		if (n < 3 || (op == 0x0C && n < 5)) { att_error(op, 0, ATT_ERR_INVALID_PDU); return; }
++		h = p[1] | p[2] << 8;
++		if (op == 0x0C) off = p[3] | p[4] << 8;
++		if (!h || h > H_LAST) { att_error(op, h, ATT_ERR_INVALID_HANDLE); return; }
++		if (h == H_RX || h == H_TX) { att_error(op, h, ATT_ERR_READ_NOT_PERM); return; }
++		v = attr_val(h, &len);
++		if (off > len) { att_error(op, h, ATT_ERR_INVALID_OFFSET); return; }
++		len -= off;
++		if (len > att_mtu - 1) len = att_mtu - 1;
++		r[0] = op + 1;
++		memcpy(&r[1], v + off, len);
++		l2cap_send(CID_ATT, r, 1 + len);
++		return;
++	}
++	case 0x12:	/* Write Request */
++	case 0x52: {	/* Write Command */
++		int h;
++		if (n < 3) { if (op == 0x12) att_error(op, 0, ATT_ERR_INVALID_PDU); return; }
++		h = p[1] | p[2] << 8;
++		if (!h || h > H_LAST || !db[h].writable) {
++			if (op == 0x12)
++				att_error(op, h, h && h <= H_LAST ? ATT_ERR_WRITE_NOT_PERM
++							   : ATT_ERR_INVALID_HANDLE);
++			return;
++		}
++		if (h == H_TX_CCC) {
++			notify_on = n >= 4 && (p[3] & 0x01);
++			db[H_TX_CCC].val[0] = notify_on;
++			say(notify_on ? "phone turned notifications on\n"
++				      : "phone turned notifications off\n");
++		}
++		if (op == 0x12) { r[0] = 0x13; l2cap_send(CID_ATT, r, 1); }
++		if (h == H_RX)
++			on_rx(&p[3], n - 3);
++		return;
++	}
++	case 0x1E:	/* Handle Value Confirmation */
++		return;
++	default:
++		/* Commands (bit 6) get no answer; requests get "not supported". */
++		if (!(op & 0x40))
++			att_error(op, 0, ATT_ERR_REQ_NOT_SUPP);
++		return;
++	}
++}
++
++/* ---------------------------------------------- L2CAP signalling, SMP ---- */
++
++static void le_sig(const uint8_t *p, int n)
++{
++	/* Answer requests (connection parameter update, credit-based channel
++	 * and disconnection requests) with Command Reject (not understood);
++	 * responses and indications need nothing. */
++	if (n < 4) return;
++	if (p[0] != 0x06 && p[0] != 0x12 && p[0] != 0x14 && p[0] != 0x17 &&
++	    p[0] != 0x19)
++		return;
++	uint8_t r[6] = { 0x01, p[1], 2, 0, 0x00, 0x00 };
++	l2cap_send(CID_LE_SIG, r, 6);
++}
++
++/*
++ * SMP: LE legacy pairing, "Just Works" only (no PIN, no MITM protection),
++ * no bonding and no keys distributed: the link gets encrypted with the
++ * short-term key for this connection only, and the phone pairs again next
++ * time.  Phones that insist on pairing before anything else (Android when
++ * connecting from the system Bluetooth settings) then go on to GATT.
++ */
++static uint8_t own_addr[6], peer_addr[6], peer_type;
++static uint8_t smp_preq[7], smp_pres[7], smp_mconf[16], smp_srand[16];
++static uint8_t smp_stk[16];
++static int smp_state;		/* 0 idle, 1 response sent, 2 confirm sent, 3 STK ready */
++
++/* AES-128 encrypt of one block (FIPS-197), big-endian key/data. */
++static const uint8_t sbox[256] = {
++	0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
++	0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
++	0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
++	0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
++	0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
++	0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
++	0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
++	0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
++	0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
++	0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
++	0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
++	0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
++	0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
++	0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
++	0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
++	0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16 };
++
++static uint8_t xt(uint8_t x) { return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1b : 0)); }
++
++static void aes128(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
++{
++	uint8_t rk[176], s[16], t[16], rc = 1;
++
++	memcpy(rk, key, 16);
++	for (int i = 16; i < 176; i += 4) {
++		uint8_t w[4] = { rk[i - 4], rk[i - 3], rk[i - 2], rk[i - 1] };
++		if (i % 16 == 0) {
++			uint8_t x = w[0];
++			w[0] = sbox[w[1]] ^ rc; w[1] = sbox[w[2]];
++			w[2] = sbox[w[3]]; w[3] = sbox[x];
++			rc = xt(rc);
++		}
++		for (int j = 0; j < 4; j++) rk[i + j] = rk[i - 16 + j] ^ w[j];
++	}
++	for (int i = 0; i < 16; i++) s[i] = in[i] ^ rk[i];
++	for (int r = 1; r <= 10; r++) {
++		for (int i = 0; i < 16; i++) t[i] = sbox[s[i]];
++		for (int c = 0; c < 4; c++)		/* ShiftRows */
++			for (int rr = 0; rr < 4; rr++)
++				s[c * 4 + rr] = t[((c + rr) % 4) * 4 + rr];
++		if (r < 10)
++			for (int c = 0; c < 4; c++) {	/* MixColumns */
++				uint8_t *a = &s[c * 4], a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
++				uint8_t x = a0 ^ a1 ^ a2 ^ a3;
++				a[0] ^= x ^ xt(a0 ^ a1); a[1] ^= x ^ xt(a1 ^ a2);
++				a[2] ^= x ^ xt(a2 ^ a3); a[3] ^= x ^ xt(a3 ^ a0);
++			}
++		for (int i = 0; i < 16; i++) s[i] ^= rk[r * 16 + i];
++	}
++	memcpy(out, s, 16);
++}
++
++/* Bluetooth e(): AES-128 on little-endian (over-the-air order) values. */
++static void bt_e(const uint8_t k[16], const uint8_t in[16], uint8_t out[16])
++{
++	uint8_t kb[16], ib[16], ob[16];
++	for (int i = 0; i < 16; i++) { kb[i] = k[15 - i]; ib[i] = in[15 - i]; }
++	aes128(kb, ib, ob);
++	for (int i = 0; i < 16; i++) out[i] = ob[15 - i];
++}
++
++/* c1 confirm value (Core spec Vol 3 Part H 2.2.3); initiator = phone. */
++static void smp_c1(const uint8_t tk[16], const uint8_t r[16], uint8_t out[16])
++{
++	uint8_t p1[16], p2[16], t[16];
++
++	p1[0] = peer_type;		/* iat' */
++	p1[1] = 0;			/* rat': our public address */
++	memcpy(&p1[2], smp_preq, 7);
++	memcpy(&p1[9], smp_pres, 7);
++	memset(p2, 0, 16);
++	memcpy(&p2[0], own_addr, 6);	/* ra */
++	memcpy(&p2[6], peer_addr, 6);	/* ia */
++	for (int i = 0; i < 16; i++) t[i] = r[i] ^ p1[i];
++	bt_e(tk, t, t);
++	for (int i = 0; i < 16; i++) t[i] ^= p2[i];
++	bt_e(tk, t, out);
++}
++
++static void smp_fail(uint8_t reason)
++{
++	uint8_t r[2] = { 0x05, reason };
++	l2cap_send(CID_SMP, r, 2);
++	smp_state = 0;
++}
++
++static void smp(const uint8_t *p, int n)
++{
++	static const uint8_t tk[16];	/* Just Works: TK = 0 */
++	uint8_t r[17];
++
++	if (n < 1) return;
++	switch (p[0]) {
++	case 0x01:	/* Pairing Request */
++		if (n < 7) { smp_fail(0x0A); return; }
++		memcpy(smp_preq, p, 7);
++		/* NoInputNoOutput, no OOB, AuthReq 0 (no bonding, no MITM, no
++		 * Secure Connections: legacy), 16-byte key, no keys either way. */
++		smp_pres[0] = 0x02; smp_pres[1] = 0x03; smp_pres[2] = 0x00;
++		smp_pres[3] = 0x00; smp_pres[4] = 16;
++		smp_pres[5] = 0x00; smp_pres[6] = 0x00;
++		l2cap_send(CID_SMP, smp_pres, 7);
++		smp_state = 1;
++		say("phone asked to pair: accepting (Just Works, nothing stored)\n");
++		return;
++	case 0x03:	/* Pairing Confirm (phone's Mconfirm) */
++		if (smp_state != 1 || n < 17) { smp_fail(0x08); return; }
++		memcpy(smp_mconf, &p[1], 16);
++		{
++			int fd = open("/dev/urandom", O_RDONLY);
++			if (fd < 0 || read(fd, smp_srand, 16) != 16) {
++				if (fd >= 0) close(fd);
++				smp_fail(0x08);
++				return;
++			}
++			close(fd);
++		}
++		r[0] = 0x03;
++		smp_c1(tk, smp_srand, &r[1]);
++		l2cap_send(CID_SMP, r, 17);
++		smp_state = 2;
++		return;
++	case 0x04: {	/* Pairing Random (phone's Mrand) */
++		uint8_t check[16], rr[16];
++		if (smp_state != 2 || n < 17) { smp_fail(0x08); return; }
++		smp_c1(tk, &p[1], check);
++		if (memcmp(check, smp_mconf, 16)) {
++			say("pairing failed: the phone's confirm value does not match\n");
++			smp_fail(0x04);
++			return;
++		}
++		r[0] = 0x04;
++		memcpy(&r[1], smp_srand, 16);
++		l2cap_send(CID_SMP, r, 17);
++		/* STK = s1(TK, Srand, Mrand): r' = Srand[63:0] || Mrand[63:0]. */
++		memcpy(&rr[0], &p[1], 8);
++		memcpy(&rr[8], smp_srand, 8);
++		bt_e(tk, rr, smp_stk);
++		smp_state = 3;
++		return;
++	}
++	case 0x05:	/* Pairing Failed from the phone */
++		say("phone cancelled pairing (reason ");
++		say_int(n >= 2 ? p[1] : -1);
++		say(")\n");
++		smp_state = 0;
++		return;
++	case 0x0B:	/* Security Request: only a peripheral sends it */
++	default:
++		return;
++	}
++}
++
++/* Controller asks for the key the phone wants to encrypt with. */
++static void ltk_request(uint16_t h)
++{
++	uint8_t pkt[18];
++
++	pkt[0] = h & 0xff;
++	pkt[1] = h >> 8;
++	if (smp_state == 3) {
++		memcpy(&pkt[2], smp_stk, 16);
++		hci_send_cmd(0x201A, pkt, 18);	/* LE LTK Request Reply */
++	} else {
++		/* The phone thinks it is bonded from an earlier session: no keys
++		 * are kept here, so refuse; it can pair again. */
++		hci_send_cmd(0x201B, pkt, 2);	/* LE LTK Request Negative Reply */
++		say("phone wanted a stored key: none kept here (remove the pairing on the phone)\n");
++	}
++}
++
++/* ACL in: reassemble L2CAP frames (start + continuation fragments). */
++static uint8_t rxbuf[ATT_MTU_MAX + 64];
++static int rx_have, rx_need;
++
++static void acl_in(const uint8_t *p, int n)
++{
++	uint16_t hf, len;
++	int pb;
++
++	if (n < 4) return;
++	hf = p[0] | p[1] << 8;
++	len = p[2] | p[3] << 8;
++	pb = (hf >> 12) & 3;
++	p += 4; n -= 4;
++	if (len < n) n = len;
++	if (pb == 0x01) {			/* continuation */
++		if (!rx_need) return;
++		if (rx_have + n > (int)sizeof rxbuf) { rx_need = 0; return; }
++		memcpy(rxbuf + rx_have, p, n);
++		rx_have += n;
++	} else {				/* start */
++		if (n < 4 || n > (int)sizeof rxbuf) { rx_need = 0; return; }
++		memcpy(rxbuf, p, n);
++		rx_have = n;
++		rx_need = 4 + (p[0] | p[1] << 8);
++	}
++	if (!rx_need || rx_have < rx_need) return;
++	{
++		int cid = rxbuf[2] | rxbuf[3] << 8, plen = rx_need - 4;
++		rx_need = 0;
++		if (cid == CID_ATT) att_handle(rxbuf + 4, plen);
++		else if (cid == CID_LE_SIG) le_sig(rxbuf + 4, plen);
++		else if (cid == CID_SMP) smp(rxbuf + 4, plen);
++	}
++}
++
++/* ------------------------------------------------------- advertising ---- */
++
++static int adv_enable(int on)
++{
++	uint8_t en[1] = { (uint8_t)on };
++	return hci_cmd(OP_LE_ADV_ENABLE, en, 1, 0, 0);
++}
++
++static int adv_setup(void)
++{
++	/* ADV_IND (connectable, scannable), 100-150 ms, public address. */
++	uint8_t ap[] = { 0xA0, 0x00, 0xF0, 0x00, 0x00, 0x00, 0x00,
++			 0, 0, 0, 0, 0, 0, 0x07, 0x00 };
++	uint8_t ad[32], sr[32];
++
++	if (must("LE Set Advertising Parameters", OP_LE_ADV_PARAMS, ap, sizeof ap))
++		return -1;
++
++	/* Advertising data: Flags + complete list of 128-bit services (NUS). */
++	memset(ad, 0, sizeof ad);
++	ad[1] = 0x02; ad[2] = 0x01; ad[3] = 0x06;
++	ad[4] = 17; ad[5] = 0x07;
++	memcpy(&ad[6], uuid_nus, 16);
++	ad[0] = 3 + 18;
++	if (must("LE Set Advertising Data", OP_LE_ADV_DATA, ad, sizeof ad))
++		return -1;
++
++	/* Scan response: Complete Local Name. */
++	memset(sr, 0, sizeof sr);
++	sr[1] = dev_name_len + 1; sr[2] = 0x09;
++	memcpy(&sr[3], dev_name, dev_name_len);
++	sr[0] = 2 + dev_name_len;
++	if (must("LE Set Scan Response Data", OP_LE_SCAN_RSP, sr, sizeof sr))
++		return -1;
++	return 0;
++}
++
++/* ----------------------------------------------------------- events ---- */
++
++static void reset_conn_state(void)
++{
++	conn = 0xffff;
++	notify_on = 0;
++	db[H_TX_CCC].val[0] = 0;
++	att_mtu = 23;
++	txq_n = 0;
++	rx_need = 0;
++	smp_state = 0;
++}
++
++static void event_in(const uint8_t *p, int n)
++{
++	uint8_t evt = p[0];
++
++	if (n < 2) return;
++	if (evt == EVT_LE_META && n >= 3 &&
++	    (p[2] == LE_CONN_COMPL || p[2] == LE_ENH_CONN_COMPL) && n >= 14) {
++		if (p[3] != 0) {
++			say("connection attempt failed, status="); say_int(p[3]); say("\n");
++			return;
++		}
++		conn = (p[4] | p[5] << 8) & 0x0fff;
++		peer_type = p[7] & 1;
++		memcpy(peer_addr, &p[8], 6);
++		say("connected: "); say_addr(&p[8]);
++		say(p[7] ? " (random address)" : " (public address)");
++		say("\n");
++		return;
++	}
++	if (evt == EVT_LE_META && n >= 5 && p[2] == 0x05) {	/* LTK Request */
++		ltk_request((p[3] | p[4] << 8) & 0x0fff);
++		return;
++	}
++	if (evt == 0x08 && n >= 6) {	/* Encryption Change */
++		if (p[2] == 0 && p[5])
++			say("link encrypted: paired\n");
++		else {
++			say("encryption failed, status="); say_int(p[2]); say("\n");
++		}
++		return;
++	}
++	if (evt == EVT_DISCONN_COMPL && n >= 6) {
++		say("disconnected (reason 0x"); hex2(p[5]); say(")\n");
++		reset_conn_state();
++		/* The controller stops advertising on a connection: restart it. */
++		if (adv_enable(1) == 0)
++			say("advertising again\n");
++		return;
++	}
++	if (evt == EVT_NUM_COMPL_PKTS && n >= 3) {
++		int k = p[2];
++		for (int i = 0; i < k && 3 + 4 * i + 3 < n; i++)
++			acl_credits += p[3 + 4 * i + 2] | p[3 + 4 * i + 3] << 8;
++		acl_flush();
++	}
++}
++
++static void on_signal(int sig)
++{
++	(void)sig;
++	stopping = 1;
++}
++
++/* --------------------------------------------------------------- main ---- */
++
++int main(int argc, char **argv)
++{
++	uint8_t pkt[1100], ret[16];
++	char inbuf[ATT_MTU_MAX];
++	int in_len = 0, stdin_open = 1;
++
++	if (argc > 1) {
++		dev_name_len = strlen(argv[1]);
++		if (dev_name_len > NAME_MAX_LEN) dev_name_len = NAME_MAX_LEN;
++		memcpy(dev_name, argv[1], dev_name_len);
++	} else {
++		if (gethostname(dev_name, NAME_MAX_LEN) < 0) strcpy(dev_name, "esp32p4");
++		dev_name[NAME_MAX_LEN] = 0;
++		dev_name_len = strlen(dev_name);
++	}
++	dev_name[dev_name_len] = 0;
++	build_db();
++
++	if (open_hci() < 0) return 2;
++	if (must("HCI Reset", OP_RESET, 0, 0)) return 3;
++
++	/* Default events + LE Meta (bit 61), which carries LE Connection Complete. */
++	{
++		uint8_t m[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0x1f, 0x00, 0x20 };
++		if (must("Set Event Mask", OP_SET_EVENT_MASK, m, 8)) return 3;
++	}
++	/* ACL buffers for LE (fall back to the shared BR/EDR ones). */
++	if (hci_cmd(OP_LE_READ_BUF, 0, 0, ret, 3) == 0 && (ret[0] | ret[1] << 8)) {
++		acl_len = ret[0] | ret[1] << 8;
++		acl_credits = ret[2];
++	} else if (hci_cmd(OP_READ_BUF_SIZE, 0, 0, ret, 7) == 0) {
++		acl_len = ret[0] | ret[1] << 8;
++		acl_credits = ret[3] | ret[4] << 8;
++	}
++	if (acl_credits < 1) acl_credits = 1;
++	att_mtu_server = acl_len - 4;
++	if (att_mtu_server > ATT_MTU_MAX) att_mtu_server = ATT_MTU_MAX;
++	if (att_mtu_server < 23) att_mtu_server = 23;
++
++	if (adv_setup() < 0) return 4;
++	if (adv_enable(1) != 0) { say("ble_server: advertising enable failed\n"); return 5; }
++
++	say("ble_server: advertising as \""); say(dev_name); say("\"");
++	if (hci_cmd(OP_READ_BD_ADDR, 0, 0, ret, 6) == 0) {
++		memcpy(own_addr, ret, 6);
++		say(", address "); say_addr(ret);
++	}
++	say("\n  service: Nordic UART (write to RX, notifications on TX)\n"
++	    "  send 'info' or 'uptime' from the phone; lines typed here go to the phone\n"
++	    "  Ctrl-C to stop\n");
++
++	signal(SIGINT, on_signal);
++	signal(SIGTERM, on_signal);
++	signal(SIGPIPE, SIG_IGN);
++
++	while (!stopping) {
++		struct pollfd pf[2] = {
++			{ .fd = sk, .events = POLLIN },
++			{ .fd = 0, .events = POLLIN },
++		};
++		int r = poll(pf, stdin_open ? 2 : 1, 1000);
++
++		if (r <= 0) continue;
++		if (pf[0].revents & POLLIN) {
++			int n = read(sk, pkt, sizeof pkt);
++			if (n <= 0) {
++				if (n < 0 && errno == EINTR) continue;
++				say("HCI socket closed\n");
++				break;
++			}
++			if (pkt[0] == HCI_EVENT_PKT && n >= 3)
++				event_in(pkt + 1, n - 1);
++			else if (pkt[0] == HCI_ACL_PKT && n >= 5)
++				acl_in(pkt + 1, n - 1);
++		}
++		if (stdin_open && (pf[1].revents & (POLLIN | POLLHUP))) {
++			int n = read(0, inbuf + in_len, sizeof inbuf - 1 - in_len);
++			if (n <= 0) {
++				stdin_open = 0;	/* background: /dev/null or closed */
++				continue;
++			}
++			in_len += n;
++			for (;;) {
++				char *nl = memchr(inbuf, '\n', in_len);
++				int l;
++				if (!nl && in_len < (int)sizeof inbuf - 1) break;
++				l = nl ? nl - inbuf + 1 : in_len;
++				if (conn == 0xffff)
++					say("(no phone connected)\n");
++				else if (!notify_on)
++					say("(the phone has not turned notifications on)\n");
++				else
++					notify((uint8_t *)inbuf, l);
++				memmove(inbuf, inbuf + l, in_len - l);
++				in_len -= l;
++			}
++		}
++	}
++
++	if (conn != 0xffff) {
++		uint8_t d[3] = { conn & 0xff, conn >> 8, 0x13 };	/* user ended */
++		hci_cmd(OP_DISCONNECT, d, 3, 0, 0);
++	}
++	adv_enable(0);
++	close(sk);
++	say("ble_server: stopped\n");
++	return 0;
++}
+diff --git a/linux/waveshare/ble-tools/hci_up.c b/linux/waveshare/ble-tools/hci_up.c
+new file mode 100644
+index 0000000..2a1885a
+--- /dev/null
++++ b/linux/waveshare/ble-tools/hci_up.c
+@@ -0,0 +1,94 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Waveshare ESP32-P4-WIFI6 port (2026-11-27): taken from linux-waveshare-xc
++ * (patches/buildroot/overlay-src, GPL-2.0-only).  Changes: the ESP-Hosted-MCU
++ * module is esp_hosted_mcu (not esp32_sdio), over SDIO instead of SPI, and a
++ * clear message when hci0 does not appear (C6 firmware without BT).
++ */
++/* Minimal hci_up — write(2) only, no stdio. Aims to avoid uClibc FLAT
++ * relocation pathologies seen with fprintf/printf in this toolchain.
++ * Also doubles as the "enable BT" poke: HCI registration is opt-in
++ * since kernel patch 0035 (the boot-time burst wedged cold boots). */
++#include <unistd.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/ioctl.h>
++
++#ifndef AF_BLUETOOTH
++#define AF_BLUETOOTH    31
++#endif
++#define BTPROTO_HCI     1
++#define HCIDEVUP        _IOW('H', 201, int)
++
++static void say(const char *s) { write(2, s, strlen(s)); }
++
++static void say_int(int v)
++{
++	char buf[16]; int n = 0; unsigned u;
++	if (v < 0) { write(2, "-", 1); u = -v; } else { u = v; }
++	if (u == 0) { write(2, "0", 1); return; }
++	while (u) { buf[n++] = '0' + u % 10; u /= 10; }
++	while (n--) write(2, &buf[n], 1);
++}
++
++/* Waveshare: the C6 BT controller must be on (eh-wifid "bt-on" RPC) before
++ * hci0 is registered; otherwise the kernel's first power-on of hci0 times
++ * out (HCI Reset -110) and hci0 stays busy until the next boot. */
++#include <sys/un.h>
++static void c6_bt_on(void)
++{
++	struct sockaddr_un a = { .sun_family = AF_UNIX };
++	char r[128];
++	int s = socket(AF_UNIX, SOCK_STREAM, 0), n;
++
++	strcpy(a.sun_path, "/run/eh-wifid.sock");
++	if (s < 0 || connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) {
++		write(2, "eh-wifid not running: cannot turn the C6 BT controller on\n", 59);
++		if (s >= 0)
++			close(s);
++		return;
++	}
++	write(s, "bt-on\n", 6);
++	shutdown(s, SHUT_WR);
++	n = read(s, r, sizeof(r) - 1);
++	if (n > 0 && r[0] != 'o')
++		write(2, r, n);
++	close(s);
++}
++
++int main(void)
++{
++	say("S0 request BT (bt_enable knob), wait for hci0\n");
++	c6_bt_on();
++	int kfd = open("/sys/module/esp_hosted_mcu/parameters/bt_enable", O_WRONLY);
++	if (kfd >= 0) {
++		write(kfd, "1", 1);
++		close(kfd);
++	}
++	int tries = 0;
++	while (access("/sys/class/bluetooth/hci0", F_OK) < 0) {
++		if (++tries > 40) {
++			say("hci0 never appeared: the C6 firmware reports no "
++			    "Bluetooth (dmesg | grep -i bt)\n");
++			return 3;
++		}
++		usleep(500000);
++	}
++
++	say("S0 socket\n");
++	int s = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
++	if (s < 0) {
++		say("socket fail errno="); say_int(errno); say("\n");
++		return 1;
++	}
++
++	say("S1 fd="); say_int(s); say(" issuing HCIDEVUP\n");
++	int r = ioctl(s, HCIDEVUP, 0);
++	int e = errno;
++	say("S2 ret="); say_int(r); say(" errno="); say_int(e); say("\n");
++
++	close(s);
++	return (r < 0) ? 2 : 0;
++}
+diff --git a/linux/waveshare/eh-wifi-sta/main/eh-wifictl.c b/linux/waveshare/eh-wifi-sta/main/eh-wifictl.c
+index 7c43e68..a5d810c 100644
+--- a/linux/waveshare/eh-wifi-sta/main/eh-wifictl.c
++++ b/linux/waveshare/eh-wifi-sta/main/eh-wifictl.c
+@@ -3,6 +3,7 @@
+  * eh-wifictl — send one command to eh-wifid and print the reply.
+  *
+  *   eh-wifictl status|scan|reload|connect SSID|ap-on|ap-off [force]|ap-reload
++ *              c6-info|c6-ota FILE|c6-activate|bt-on|bt-off
+  *
+  * Small on purpose (no ESP-Hosted code): every exec on NOMMU loads the whole
+  * program into RAM.  Exit status 1 when the daemon answers "error:".
+diff --git a/linux/waveshare/eh-wifi-sta/main/eh-wifid.c b/linux/waveshare/eh-wifi-sta/main/eh-wifid.c
+index 2a96e9e..d66ac1c 100644
+--- a/linux/waveshare/eh-wifi-sta/main/eh-wifid.c
++++ b/linux/waveshare/eh-wifi-sta/main/eh-wifid.c
+@@ -50,6 +50,9 @@
+ #include "esp_netif.h"
+ #include "esp_wifi.h"
+ #include "esp_hosted_examples_common.h"
++#include "eh_host_sys.h"
++#include "eh_host_cp_ota.h"
++#include "eh_host_bt.h"
+ 
+ #define MAX_NETS		16
+ #define MAX_NETFILES		4
+@@ -616,6 +619,164 @@ static void cmd_scan(int fd)
+ 		    rec[i].ssid[0] ? (const char *)rec[i].ssid : "(hidden)");
+ }
+ 
++/* ------------------------------------------------------- C6 and BT ---- */
++
++/*
++ * c6-info, c6-ota FILE, c6-activate, bt-on, bt-off.  They live here because
++ * /dev/esps0 (the RPC channel) accepts a single opener.
++ *
++ * c6-ota only writes the C6's free OTA slot (the running firmware is not
++ * touched) and verifies it there (ota_end); c6-activate is a separate step
++ * that makes the C6 boot the new slot.  The C6 firmware is built without
++ * rollback: a new image that boots but does not talk to the P4 has to be
++ * fixed over the C6's UART (cable).
++ */
++#define C6_OTA_SLOT_MAX		0x1c0000	/* ota_0/ota_1 size in the C6 table */
++#define C6_OTA_CHUNK		1024u
++#define ESP_IMAGE_MAGIC		0xE9
++#define ESP_CHIP_ID_ESP32C6	0x000D
++#define ESP_APP_DESC_MAGIC	0xABCD5432u
++
++static void cmd_c6_info(int fd)
++{
++	eh_host_coprocessor_fwver_t v = { 0 };
++	esp_hosted_app_desc_t d;
++	esp_err_t e;
++
++	e = eh_host_sys_get_cp_fw_version(&v);
++	if (e == ESP_OK)
++		out(fd, "esp_hosted=%u.%u.%u\n", (unsigned)v.major1,
++		    (unsigned)v.minor1, (unsigned)v.patch1);
++	else
++		out(fd, "esp_hosted=? (%s)\n", esp_err_to_name(e));
++	memset(&d, 0, sizeof(d));
++	e = eh_host_sys_get_cp_app_desc(&d);
++	if (e == ESP_OK) {
++		out(fd, "project=%.32s\n", d.project_name);
++		out(fd, "version=%.32s\n", d.version);
++		out(fd, "idf=%.32s\n", d.idf_ver);
++		out(fd, "built=%.16s %.16s\n", d.date, d.time);
++	} else {
++		out(fd, "app_desc=? (%s)\n", esp_err_to_name(e));
++	}
++}
++
++static uint32_t le32(const uint8_t *p)
++{
++	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static void cmd_c6_ota(int fd, const char *path)
++{
++	static uint8_t buf[C6_OTA_CHUNK];
++	uint8_t hdr[32 + 256];
++	struct stat sb;
++	size_t n, total = 0;
++	int f, pct = -1;
++	esp_err_t e;
++
++	if (!path || !*path) {
++		out(fd, "error: usage: c6-ota FILE.bin (the C6 app image, not a full flash dump)\n");
++		return;
++	}
++	f = open(path, O_RDONLY);
++	if (f < 0 || fstat(f, &sb) < 0) {
++		out(fd, "error: %s: %s\n", path, strerror(errno));
++		if (f >= 0)
++			close(f);
++		return;
++	}
++	/* Refuse anything that is not an ESP32-C6 app image that fits the slot. */
++	if (sb.st_size < (off_t)sizeof(hdr) || sb.st_size > C6_OTA_SLOT_MAX ||
++	    read(f, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr) ||
++	    hdr[0] != ESP_IMAGE_MAGIC ||
++	    (hdr[12] | hdr[13] << 8) != ESP_CHIP_ID_ESP32C6 ||
++	    le32(hdr + 32) != ESP_APP_DESC_MAGIC) {
++		out(fd, "error: %s is not an ESP32-C6 app image of at most %u bytes "
++			"(size %ld, magic 0x%02x, chip 0x%04x)\n", path,
++			C6_OTA_SLOT_MAX, (long)sb.st_size, hdr[0], hdr[12] | hdr[13] << 8);
++		close(f);
++		return;
++	}
++	out(fd, "image: project=%.32s version=%.32s idf=%.32s size=%ld\n",
++	    (const char *)hdr + 32 + 48, (const char *)hdr + 32 + 16,
++	    (const char *)hdr + 32 + 112, (long)sb.st_size);
++	lseek(f, 0, SEEK_SET);
++
++	ESP_LOGI(TAG, "c6-ota: %s (%ld bytes)", path, (long)sb.st_size);
++	e = eh_host_cp_ota_begin();
++	if (e != ESP_OK) {
++		out(fd, "error: ota_begin: %s\n", esp_err_to_name(e));
++		close(f);
++		return;
++	}
++	while ((n = read(f, buf, sizeof(buf))) > 0) {
++		e = eh_host_cp_ota_write(buf, n);
++		if (e != ESP_OK) {
++			out(fd, "error: ota_write at byte %zu: %s (the running C6 firmware "
++				"is untouched; nothing was activated)\n", total, esp_err_to_name(e));
++			close(f);
++			return;
++		}
++		total += n;
++		if ((int)(total * 10 / sb.st_size) != pct) {
++			pct = total * 10 / sb.st_size;
++			out(fd, "%d%%\n", pct * 10);
++		}
++	}
++	close(f);
++	if (total != (size_t)sb.st_size) {
++		out(fd, "error: read %zu of %ld bytes\n", total, (long)sb.st_size);
++		return;
++	}
++	e = eh_host_cp_ota_end();
++	if (e != ESP_OK) {
++		out(fd, "error: ota_end (image check on the C6): %s; nothing was activated\n",
++		    esp_err_to_name(e));
++		return;
++	}
++	ESP_LOGI(TAG, "c6-ota: %zu bytes written and verified", total);
++	out(fd, "ok: %zu bytes written to the C6's free slot and verified; "
++		"the C6 still runs the old firmware until 'c6-activate'\n", total);
++}
++
++static void cmd_c6_activate(int fd)
++{
++	esp_err_t e = eh_host_cp_ota_activate();
++
++	ESP_LOGI(TAG, "c6-activate: %s", esp_err_to_name(e));
++	if (e == ESP_OK)
++		out(fd, "ok: the C6 boots the new firmware now (Wi-Fi drops for a while)\n");
++	else
++		out(fd, "error: ota_activate: %s\n", esp_err_to_name(e));
++}
++
++static void cmd_bt(int fd, bool on)
++{
++	esp_err_t e;
++
++	if (on) {
++		e = eh_host_bt_controller_init();
++		/* Firmware with BT auto-init answers "already initialised". */
++		if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
++			out(fd, "error: bt init: %s\n", esp_err_to_name(e));
++			return;
++		}
++		e = eh_host_bt_controller_enable();
++		if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
++			out(fd, "error: bt enable: %s\n", esp_err_to_name(e));
++			return;
++		}
++	} else {
++		e = eh_host_bt_controller_disable();
++		if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
++			out(fd, "error: bt disable: %s\n", esp_err_to_name(e));
++			return;
++		}
++	}
++	out(fd, "ok\n");
++}
++
+ static void handle(int fd)
+ {
+ 	char cmd[96];
+@@ -680,6 +841,14 @@ static void handle(int fd)
+ 		} else {
+ 			out(fd, "ok: soft-AP is off; new settings apply next time\n");
+ 		}
++	} else if (!strcmp(cmd, "c6-info")) {
++		cmd_c6_info(fd);
++	} else if (!strcmp(cmd, "c6-ota")) {
++		cmd_c6_ota(fd, arg);
++	} else if (!strcmp(cmd, "c6-activate")) {
++		cmd_c6_activate(fd);
++	} else if (!strcmp(cmd, "bt-on") || !strcmp(cmd, "bt-off")) {
++		cmd_bt(fd, cmd[3] == 'o' && cmd[4] == 'n');
+ 	} else {
+ 		out(fd, "error: unknown command '%s'\n", cmd);
+ 	}
+diff --git a/linux/waveshare/eh-wifi-sta/sdkconfig.defaults b/linux/waveshare/eh-wifi-sta/sdkconfig.defaults
+index bccd50c..09e04b1 100644
+--- a/linux/waveshare/eh-wifi-sta/sdkconfig.defaults
++++ b/linux/waveshare/eh-wifi-sta/sdkconfig.defaults
+@@ -24,3 +24,7 @@ CONFIG_EH_EXAMPLE_WIFI_MAXIMUM_RETRY=2147483647
+ # v2 eh-wifid soft-AP: esp_netif sets 192.168.4.1 on ethap0 and runs
+ # BusyBox udhcpd -f for the clients.
+ CONFIG_ESP_NETIF_LINUX_DHCP_SERVER_BACKEND_UDHCPD=y
++# BLE controller on/off over RPC (eh-wifictl bt-on / bt-off) and the C6
++# firmware update (c6-ota) need these; the HCI traffic itself goes through
++# the kernel module (hci0), not this program.
++CONFIG_ESP_HOSTED_HOST_FEAT_BT=y
+diff --git a/linux/waveshare/kernel-bt.config.fragment b/linux/waveshare/kernel-bt.config.fragment
+new file mode 100644
+index 0000000..401cd3e
+--- /dev/null
++++ b/linux/waveshare/kernel-bt.config.fragment
+@@ -0,0 +1,20 @@
++
++# Waveshare BLE (WS_BT=1, the default).  The C6 is a BLE-only controller:
++# LE without BR/EDR (no Classic, so no audio profiles).  The HCI device is
++# registered by esp32_sdio.ko (CONFIG_BT_ENABLED in its Makefile), only when
++# the C6 reports BT over SDIO and someone writes 1 to
++# /sys/module/esp32_sdio/parameters/bt_enable.  No BlueZ (it needs an MMU):
++# the tools (hci_up, ble_scan, ble_adv) use HCI_CHANNEL_USER sockets.
++# Measured 2026-11-27: +315 KB text, +31 KB data.
++CONFIG_BT=y
++CONFIG_BT_LE=y
++# CONFIG_BT_BREDR is not set
++# CONFIG_BT_MSFTEXT is not set
++# CONFIG_BT_AOSPEXT is not set
++# CONFIG_BT_SELFTEST is not set
++# CONFIG_BT_FEATURE_DEBUG is not set
++# CONFIG_BT_HCIBTSDIO is not set
++# CONFIG_BT_HCIUART is not set
++# CONFIG_BT_HCIVHCI is not set
++# CONFIG_BT_MRVL is not set
++# CONFIG_BT_MTKSDIO is not set
+diff --git a/linux/waveshare/rootfs-overlay/etc/init.d/S40network b/linux/waveshare/rootfs-overlay/etc/init.d/S40network
+index 473f4ce..520aa4a 100755
+--- a/linux/waveshare/rootfs-overlay/etc/init.d/S40network
++++ b/linux/waveshare/rootfs-overlay/etc/init.d/S40network
+@@ -75,6 +75,45 @@ mount_boot() {
+ 	fi
+ }
+ 
++# The C6 SDIO link sometimes fails at boot (about 1 in 9 soft reboots,
++# 2026-11-27): mmc1 enumerates the C6, then the C6 stops answering and the
++# esp_hosted_mcu probe fails with -110, so no ethsta0.  Re-enumerating mmc1
++# from Linux (dw_mmc unbind/bind plus a GPIO54 C6 reset) does not bring it
++# back and the kernel cannot unload modules, but a full reboot does (the
++# boot shim sets up the slot and resets the C6).  So reboot, at most
++# SDIO_RETRY_MAX times in a row.  The count survives the reboot in the
++# previous boot's console log (pstore console-ramoops, kept across a warm
++# reboot); a boot that comes up fine leaves no mark, so the count restarts.
++SDIO_FUNC=/sys/bus/sdio/devices/mmc1:0001:1
++SDIO_RETRY_MAX=2
++SDIO_MARK="WS-NET: SDIO retry reboot"
++
++sdio_check() {
++	n=0
++	while [ ! -e "$SDIO_FUNC/driver" ] && [ "$n" -lt 5 ]; do
++		n=$((n + 1))
++		sleep 1
++	done
++	[ -e "$SDIO_FUNC/driver" ] && return 0
++	prev=0
++	for f in /sys/fs/pstore/console-ramoops-*; do
++		[ -r "$f" ] || continue
++		p=$(sed -n "s/.*$SDIO_MARK \([0-9][0-9]*\).*/\1/p" "$f" | tail -n 1)
++		[ -n "$p" ] && prev=$p
++	done
++	if [ "$prev" -ge "$SDIO_RETRY_MAX" ]; then
++		log "ERROR: C6 SDIO link still down after $prev retry reboots; not retrying (dmesg | grep mmc1)"
++		return 1
++	fi
++	n=$((prev + 1))
++	# Level 3 so it reaches the console and therefore the pstore record.
++	echo "<3>$SDIO_MARK $n of $SDIO_RETRY_MAX: the C6 did not answer on SDIO" > /dev/kmsg
++	log "C6 SDIO link down: rebooting (retry $n of $SDIO_RETRY_MAX)"
++	sync
++	reboot
++	sleep 30
++}
++
+ wait_iface() {
+ 	n=0
+ 	while [ "$n" -lt 30 ]; do
+@@ -138,6 +177,7 @@ case "${1:-start}" in
+ 		load_module || exit 1
+ 		# Do not hold up the console login while the C6 comes up.
+ 		(
++			sdio_check
+ 			if wait_iface; then
+ 				log "$IFACE appeared"
+ 				start_sta

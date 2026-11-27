@@ -1494,6 +1494,182 @@ también borra `/boot`).
   cortes por escribir en la microSD.  Ver los commits de
   `source/0002-waveshare-audio.patch`.
 
+### 11.13 Bluetooth (BLE)
+
+El ESP32-C6 de la placa tiene **Bluetooth LE 5** además del Wi-Fi.  El P4
+no tiene radio: Linux habla con el controlador BLE del C6 por el mismo
+enlace SDIO del Wi-Fi (HCI sobre ESP-Hosted).  Desde el 2026-11-27 Linux
+escanea, anuncia y atiende conexiones de un celular.  Probado en la placa.
+
+**Solo BLE.**  El C6 no tiene Bluetooth clásico (BR/EDR) ni LE Audio:
+- **no** puede ser un parlante Bluetooth (A2DP);
+- **no** hay puerto serie clásico (SPP), ni teclados o auriculares clásicos.
+
+Lo comprobé en ESP-IDF v5.5.5: `SOC_BT_CLASSIC_SUPPORTED` solo existe para
+el ESP32 original, y el controlador del C6 no tiene canales isócronos.
+
+**Hace falta otro firmware**, en el P4 y en el C6.  Las imágenes de
+`firmware/` **no** lo traen.
+
+| Dónde | Pieza | Qué hace |
+|---|---|---|
+| P4, 0x90000 | kernel con `CONFIG_BT=y`, solo LE (`linux/waveshare/kernel-bt.config.fragment`) | sockets HCI; sin BlueZ, que necesita MMU |
+| P4, 0x810000 | rootfs | `esp_hosted_mcu.ko` registra `hci0` solo cuando se lo pide una herramienta; `eh-wifid` con `c6-info`, `c6-ota`, `c6-activate`, `bt-on`, `bt-off`; `ble_scan`, `ble_adv`, `ble_server`, `ble-ap`, `ble-server` |
+| C6, ranura `ota_1` | `firmware/c6-ble/eh_cp_wifi_sta-bt1.bin` | el mismo `eh_cp_wifi_sta` 3.0.10 de fábrica, compilado con el controlador BLE |
+
+El shim y el DTB son los del audio (11.12).  Las fuentes del P4 están en
+`source/0003-waveshare-bluetooth.patch`, que se aplica después del 0002.
+
+#### El firmware del C6
+
+Es el ejemplo `eh_cp_wifi_sta` de esp-hosted-mcu (v3.0.10-25-g1efaa56f),
+con ESP-IDF v5.5.5, sin cambios en el código.  Solo cambian 4 opciones
+(`BT_ENABLED`, `BT_CONTROLLER_ONLY`, `ESP_HOSTED_CP_BT_ENABLED`,
+`ESP_HOSTED_CP_FEAT_BT`): la configuración completa está en
+`source/c6-ble-sdkconfig`.
+- Compilado sin esas opciones, sale igual byte a byte al de fábrica, salvo
+  fecha, hora y hashes.
+- Ocupa 1.360.960 bytes de una ranura de 1.835.008.
+- Las opciones de BLE y de coexistencia son las del ejemplo de Espressif
+  para Wi-Fi + BLE (`bleprph_wifi_coex`, C6): las comparé una por una.
+
+**Actualizarlo** (desde Linux, como `root`; sin cables ni jumpers):
+
+```sh
+eh-wifictl c6-info                                 # versión actual
+eh-wifictl c6-ota /tmp/eh_cp_wifi_sta-bt1.bin      # escribe la ranura libre y verifica
+eh-wifictl c6-activate                             # el C6 marca la nueva ranura y se reinicia
+reboot
+```
+
+- `c6-ota` revisa que el archivo sea una imagen de ESP32-C6 antes de
+  escribir.  Con otro archivo se niega.
+- Hasta `c6-activate`, el C6 sigue con el firmware viejo.
+- La ranura de fábrica (`ota_0`) no se toca.
+
+Salida real:
+
+```
+image: project=eh_cp_wifi_sta version=v3.0.10-25-g1efaa56f-bt1 idf=v5.5.5 size=1360960
+0%
+...
+100%
+ok: 1360960 bytes written to the C6's free slot and verified; the C6 still runs the old firmware until 'c6-activate'
+```
+
+Después, `dmesg | grep capabilities` dice `0xd` (Wi-Fi + BLE).
+
+**Volver al firmware de fábrica:** hay que decirle al C6 que arranque
+`ota_0` otra vez, grabando los 8 KB de `otadata` en `0xd000`.  Eso sí
+necesita un adaptador USB-serie en los pads del C6 (`C6_U0TXD`,
+`C6_U0RXD`, `C6_EN`, `C6_IO9`, GND):
+
+```bash
+esptool --chip esp32c6 --port PUERTO --baud 115200 write-flash 0xd000 firmware/c6-ble/otadata-ota0.bin
+```
+
+- Con el adaptador CP2102 que usé, 460800 baudios no anduvo: usá 115200.
+- **Antes de tocar el C6, hacé un backup de toda su flash** (`esptool
+  --chip esp32c6 --port PUERTO --baud 115200 read-flash 0 0x400000
+  c6-backup.bin`).  Ese backup tiene tus redes Wi-Fi: no lo compartas.
+- **Para uso normal, `C6_IO9` tiene que quedar libre.**  Con un jumper a
+  masa, el C6 arranca en modo de programación en cada reinicio
+  (`boot:0x4 (DOWNLOAD…)` en su consola), y no hay Wi-Fi ni Bluetooth.
+
+#### Herramientas
+
+Hablan HCI directo con el controlador por un socket `HCI_CHANNEL_USER`.
+Antes de usarlo, cada una:
+1. enciende el controlador del C6 (`bt-on`, por `eh-wifid`);
+2. pide que se registre `hci0`;
+3. si el kernel ya lo tiene, lo baja (`HCIDEVDOWN`) y lo toma.
+
+**Una por vez:** la segunda recibe `EBUSY`.
+
+| Comando | Qué hace |
+|---|---|
+| `ble_scan` | escanea 20 s: dirección, RSSI y nombre de lo que anuncia cerca |
+| `ble_scan reset` | solo prueba que el controlador conteste |
+| `ble_adv [NOMBRE]` | anuncia la placa, sin aceptar conexiones |
+| `ble-ap [NOMBRE]` | servidor para el celular en segundo plano; `ble-ap status`, `ble-ap stop`; log en `/run/ble-ap.log` |
+| `ble-server [NOMBRE]` | el mismo servidor en primer plano: muestra lo que manda el celular, y lo que escribís le llega |
+
+**El servidor (`ble_server`)** anuncia la placa como conectable y ofrece:
+- **Nordic UART Service** (`6E400001-B5A3-F393-E0A9-E50E24DCCA9E`): el
+  celular escribe en RX (`…0002`) y recibe en TX (`…0003`, con
+  notificaciones).  `info` devuelve nombre y kernel, `uptime` los segundos
+  desde el arranque; lo demás vuelve como `echo: …`.
+- **Device Information**: fabricante y modelo.
+- **Lo que llega nunca se ejecuta** como comando.
+
+Log real de `ble-server` con un celular Android y después con la Mac:
+
+```
+ble_server: advertising as "P4-test", address 98:a3:16:83:6f:e6
+connected: 4e:a3:87:bb:df:3e (random address)
+phone asked to pair: accepting (Just Works, nothing stored)
+link encrypted: paired
+...
+connected: 9c:58:84:73:f0:4e (public address)
+ATT MTU 247
+phone turned notifications on
+rx: info
+rx: uptime
+rx: hola desde el Mac
+disconnected (reason 0x13)
+advertising again
+```
+
+**Emparejamiento:** Android empareja apenas se conecta y corta si la placa
+se niega.  Por eso el servidor acepta "Just Works":
+- sin PIN y sin protección contra un intermediario;
+- no guarda claves: el celular empareja de nuevo cada vez.
+
+El enlace va cifrado, pero cualquiera que esté cerca se puede conectar.
+
+**Wi-Fi y BLE a la vez:** durante un escaneo de 20 s, 75 pings desde la
+computadora no perdieron ninguno (latencia media 43 ms, contra 52 ms sin
+BLE).
+
+#### El enlace con el C6 al arrancar
+
+En alrededor de 1 de cada 9 reinicios con `reboot`, el C6 no contesta por
+SDIO al arrancar:
+- el kernel lo ve (`mmc1: new SDIO card`) y después deja de contestarle;
+- `esp_hosted_mcu` falla con `-110` y no aparece `ethsta0`;
+- no hay Wi-Fi.
+
+Ya pasaba antes del firmware de Bluetooth.  En los arranques buenos, el
+primer intento a 5 MHz también falla, y el reintento del kernel anda.
+
+Desde Linux no se puede recuperar:
+- el kernel no descarga módulos;
+- volver a enumerar `mmc1` y reiniciar el C6 por GPIO54 tampoco alcanza.
+
+Un reinicio completo sí, porque pasa por el boot shim.  Entonces
+`S40network`:
+1. espera 5 s a que el driver tome el C6;
+2. si no lo toma, deja una marca en el log del kernel (`WS-NET: SDIO retry
+   reboot 1 of 2`) y reinicia;
+3. al arrancar, lee la marca del arranque anterior en
+   `/sys/fs/pstore/console-ramoops-0`, que sobrevive a un `reboot`;
+4. después de 2 reintentos seguidos no insiste más, así que no puede quedar
+   en un ciclo de reinicios.
+
+En 10 reinicios seguidos, 3 necesitaron un reintento, y los 10 terminaron
+con Wi-Fi (30 s, o 57 s con el reintento).
+
+#### Límites
+
+- **Un celular por vez**, y una herramienta BLE por vez.
+- **No hay parlante Bluetooth** ni nada de Bluetooth clásico (ver arriba).
+  Para eso haría falta otro chip con Bluetooth clásico, por ejemplo un
+  ESP32 original, pasándole el audio al P4 por I2S.
+- El servidor no implementa escrituras largas (`Prepare Write`): cada
+  mensaje tiene que entrar en el MTU (hasta 244 bytes con MTU 247).
+- La causa de fondo de las fallas del enlace SDIO sigue sin encontrarse: el
+  reintento las esquiva.
+
 ---
 
 ## Anexo A. Qué se hizo y por qué funcionó
@@ -1569,9 +1745,11 @@ Por qué esto anda:
 - **ESP-Hosted-MCU 3.0.10**, proyecto `eh_cp_wifi_sta`, ESP-IDF v5.5.5.
 - El driver de Linux lo informa al arrancar: `slave fw version:
   0x0003000a`, `RPC version negotiated: V2`.
-- **No se modificó**: en todo este trabajo no se escribió ni borró la flash
-  del C6.
-- **No existe backup** de la flash del C6.
+- Hasta el 2026-11-27 no se modificó.  Ese día se hizo un backup completo
+  de su flash (4 MB, con un adaptador USB-serie) y se actualizó desde Linux
+  al mismo firmware con BLE (`v3.0.10-25-g1efaa56f-bt1`, ranura `ota_1`).
+  Ver 11.13.
+- El de fábrica sigue en la ranura `ota_0`.
 
 ### A.5 Dónde está cada cosa
 
@@ -1582,7 +1760,8 @@ Por qué esto anda:
 - `docs/INSTALAR.md`: backup, instalación y cómo volver atrás.
 
 **No existe un backup "oficial" del C6** (ni del P4): cada usuario tiene
-que hacer el suyo antes de grabar.
+que hacer el suyo antes de grabar.  El backup del C6 contiene las redes
+Wi-Fi guardadas: no lo compartas.
 
 ---
 

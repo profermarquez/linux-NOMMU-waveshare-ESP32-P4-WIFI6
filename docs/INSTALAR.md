@@ -65,6 +65,11 @@ estación.  Este paquete **no** graba el C6.
     a masa al encender, según el FAQ de Waveshare.
   - **Este procedimiento no está probado en este proyecto.**  Grabar el C6
     es irreversible si no tenés un backup de su flash.
+- **Para Bluetooth (BLE)** el C6 necesita el mismo firmware compilado con
+  BLE.  Ese sí se probó: se graba desde Linux con `eh-wifictl c6-ota`, sin
+  cables, y el de fábrica queda en la otra ranura.  Ver la guía, 11.13.
+- **`C6_IO9` a masa es solo para grabarlo por cable.**  Si queda así, el C6
+  arranca siempre en modo de programación y no hay Wi-Fi.
 
 ## 1. Grabar el P4
 
